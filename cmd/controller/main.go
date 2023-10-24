@@ -4,13 +4,12 @@ import (
 	"flag"
 	"fmt"
 	stdlog "log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/go-kit/kit/log/level"
-	"github.com/go-kit/log"
 	"github.com/oklog/run"
 	"github.com/philipgough/hashring-controller/pkg/controller"
 	"github.com/philipgough/hashring-controller/pkg/signals"
@@ -58,10 +57,8 @@ func main() {
 		stdlog.Fatalf("error listening on %s: %s", defaultListen, err.Error())
 	}
 
-	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
-	logger = log.WithPrefix(logger, "ts", log.DefaultTimestampUTC)
-	logger = log.WithPrefix(logger, "caller", log.DefaultCaller)
-	logger = log.With(logger, "component", "hashring-controller")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	logger = logger.With("component", "hashring-controller")
 
 	r := prometheus.NewRegistry()
 	r.MustRegister(
@@ -138,7 +135,7 @@ func main() {
 	if err := g.Run(); err != nil {
 		stdlog.Fatalf("error running controller: %s", err.Error())
 	}
-	level.Info(logger).Log("msg", "controller stopped gracefully")
+	logger.Info("controller stopped gracefully")
 }
 
 func init() {

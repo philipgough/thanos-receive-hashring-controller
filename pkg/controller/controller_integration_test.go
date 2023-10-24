@@ -5,10 +5,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 
 	corev1 "k8s.io/api/core/v1"
@@ -354,7 +354,7 @@ func runController(t *testing.T, ctx context.Context, cfg *rest.Config, namespac
 		kubeClient,
 		namespace,
 		opts,
-		log.NewNopLogger(),
+		slog.Default(),
 		prometheus.NewRegistry(),
 	)
 

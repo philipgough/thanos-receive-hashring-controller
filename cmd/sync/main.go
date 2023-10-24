@@ -1,16 +1,16 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	stdlog "log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/go-kit/kit/log/level"
-	"github.com/go-kit/log"
 	"github.com/oklog/run"
 	"github.com/philipgough/hashring-controller/pkg/controller"
 	"github.com/philipgough/hashring-controller/pkg/signals"
@@ -60,10 +60,8 @@ func main() {
 		stdlog.Fatalf("error building kubernetes clientset: %s", err.Error())
 	}
 
-	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
-	logger = log.WithPrefix(logger, "ts", log.DefaultTimestampUTC)
-	logger = log.WithPrefix(logger, "caller", log.DefaultCaller)
-	logger = log.With(logger, "component", "hashring-syncer")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	logger = logger.With("component", "hashring-syncer")
 
 	r := prometheus.NewRegistry()
 	r.MustRegister(
@@ -105,7 +103,7 @@ func main() {
 	// todo this might be better handled as a subcommand
 	if wait {
 		if err := controller.WaitForFileToSync(ctx); err != nil {
-			level.Error(logger).Log("msg", "failed to wait for file to sync to disk", "err", err)
+			logger.Error("failed to wait for file to sync to disk", "err", err)
 			os.Exit(1)
 		}
 		os.Exit(0)
@@ -133,7 +131,7 @@ func main() {
 			mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
 			})
-			if err := http.Serve(l, mux); err != nil && err != http.ErrServerClosed {
+			if err := http.Serve(l, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return fmt.Errorf("server error: %w", err)
 			}
 			return nil
@@ -147,7 +145,7 @@ func main() {
 	if err := g.Run(); err != nil {
 		stdlog.Fatalf("error running controller: %s", err.Error())
 	}
-	level.Info(logger).Log("msg", "controller stopped gracefully")
+	logger.Info("controller stopped gracefully")
 }
 
 func init() {

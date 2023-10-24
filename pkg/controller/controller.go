@@ -4,12 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"k8s.io/utils/pointer"
+	"log/slog"
 	"sort"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/philipgough/hashring-controller/pkg/config"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -28,6 +26,7 @@ import (
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/utils/pointer"
 )
 
 const (
@@ -106,7 +105,7 @@ type Controller struct {
 	namespace string
 	// buildFQDN is a function that builds a FQDN from a hostname and a service name
 	buildFQDN func(hostname, serviceName string) string
-	logger    log.Logger
+	logger    *slog.Logger
 	metrics   *metrics
 }
 
@@ -134,14 +133,10 @@ func NewController(
 	client clientset.Interface,
 	namespace string,
 	opts *Options,
-	logger log.Logger,
+	logger *slog.Logger,
 	registry *prometheus.Registry,
 ) *Controller {
 	opts = buildOpts(opts)
-
-	if logger == nil {
-		logger = log.NewNopLogger()
-	}
 
 	ctrlMetrics := newMetrics()
 	if registry == nil {
@@ -168,7 +163,7 @@ func NewController(
 			workqueue.RateLimitingQueueConfig{Name: "endpoint_slice"}),
 		workerLoopPeriod: time.Second,
 		namespace:        namespace,
-		tracker:          newTracker(opts.TTL, log.With(logger, "component", "endpointslice_tracker")),
+		tracker:          newTracker(opts.TTL, logger.With("component", "endpointslice_tracker")),
 		logger:           logger,
 		metrics:          ctrlMetrics,
 	}
@@ -236,21 +231,21 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 	defer c.queue.ShutDown()
 
 	// Start the informer factories to begin populating the informer caches
-	level.Info(c.logger).Log("msg", "starting hashring controller")
-	level.Info(c.logger).Log("msg", "waiting for informer caches to sync")
+	c.logger.Info("starting hashring controller")
+	c.logger.Info("waiting for informer caches to sync")
 
 	if ok := cache.WaitForCacheSync(ctx.Done(), c.endpointSlicesSynced, c.configMapSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	level.Info(c.logger).Log("msg", "starting workers", "count", workers)
+	c.logger.Info("starting workers", slog.Int("count", workers))
 	for i := 0; i < workers; i++ {
 		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
 
-	level.Info(c.logger).Log("msg", "started workers")
+	c.logger.Info("started workers")
 	<-ctx.Done()
-	level.Info(c.logger).Log("msg", "shutting down workers")
+	c.logger.Info("shutting down workers")
 
 	return nil
 }
@@ -300,7 +295,7 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 		// Finally, if no error occurs we Forget this item so it does not
 		// get queued again until another change happens.
 		c.queue.Forget(obj)
-		level.Debug(c.logger).Log("msg", "successfully synced", "resourceName", key)
+		c.logger.Debug("successfully synced", "resourceName", key)
 		return nil
 	}(obj)
 
@@ -327,7 +322,7 @@ func (c *Controller) enqueueEndpointSlice(obj interface{}) {
 
 // syncHandler compares the actual state with the desired, and attempts to converge the two.
 func (c *Controller) syncHandler(ctx context.Context, key string) error {
-	level.Debug(c.logger).Log("msg", "syncHandler called", "resourceName", key)
+	c.logger.Debug("syncHandler called", "resourceName", key)
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
@@ -496,7 +491,7 @@ func (c *Controller) defaultBuildFQDN(hostname, serviceName string) string {
 func (c *Controller) onEndpointSliceAdd(obj interface{}) {
 	eps, ok := obj.(*discoveryv1.EndpointSlice)
 	if !ok {
-		level.Error(c.logger).Log("msg", "unexpected object type", "type", fmt.Sprintf("%T", obj))
+		c.logger.Error("unexpected object type", "type", fmt.Sprintf("%T", obj))
 		return
 	}
 
@@ -526,7 +521,7 @@ func (c *Controller) onEndpointSliceUpdate(oldObj, newObj interface{}) {
 func (c *Controller) onEndpointSliceDelete(obj interface{}) {
 	eps, ok := obj.(*discoveryv1.EndpointSlice)
 	if !ok {
-		level.Error(c.logger).Log("msg", "unexpected object type", "type", fmt.Sprintf("%T", obj))
+		c.logger.Error("unexpected object type", "type", fmt.Sprintf("%T", obj))
 		return
 	}
 
@@ -560,9 +555,9 @@ func (c *Controller) handleObject(obj interface{}) {
 			utilruntime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type"))
 			return
 		}
-		level.Info(c.logger).Log("msg", "recovered deleted object", "resourceName", object.GetName())
+		c.logger.Info("recovered deleted object", "resourceName", object.GetName())
 	}
-	level.Info(c.logger).Log("msg", "processing object", "object", object.GetName())
+	c.logger.Info("processing object", "object", object.GetName())
 	ownerRefs := object.GetOwnerReferences()
 
 	for _, ownerRef := range ownerRefs {
@@ -572,7 +567,7 @@ func (c *Controller) handleObject(obj interface{}) {
 
 		eps, err := c.endpointSliceLister.EndpointSlices(object.GetNamespace()).Get(ownerRef.Name)
 		if err != nil {
-			level.Info(c.logger).Log("msg", "ignore orphaned object",
+			c.logger.Info("ignore orphaned object",
 				"object", object.GetName(), "owner", ownerRef.Name)
 			return
 		}

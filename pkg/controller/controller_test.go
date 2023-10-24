@@ -3,12 +3,12 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/philipgough/hashring-controller/pkg/config"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -123,7 +123,7 @@ func TestUpdatesConfigMap(t *testing.T) {
 	ctrl := &Controller{
 		configMapName: DefaultConfigMapName,
 		namespace:     metav1.NamespaceDefault,
-		logger:        log.NewNopLogger(),
+		logger:        slog.Default(),
 	}
 	data := hashringsAsStringData(t, config.Hashrings{
 		{
@@ -178,7 +178,7 @@ func TestUpdateConfigMapWithNotReady(t *testing.T) {
 	ctrl := &Controller{
 		configMapName: DefaultConfigMapName,
 		namespace:     metav1.NamespaceDefault,
-		logger:        log.NewNopLogger(),
+		logger:        slog.Default(),
 	}
 	data := hashringsAsStringData(t, config.Hashrings{
 		{
@@ -252,7 +252,7 @@ func (f *fixture) newController(ctx context.Context) (*Controller, informers.Sha
 		f.kubeclient,
 		metav1.NamespaceDefault,
 		nil,
-		log.NewNopLogger(),
+		slog.Default(),
 		prometheus.NewRegistry(),
 	)
 
@@ -498,7 +498,7 @@ func TestControllerGenerate(t *testing.T) {
 				buildFQDN: func(hostname, svc string) string {
 					return hostname
 				},
-				logger: log.NewNopLogger(),
+				logger: slog.Default(),
 			}
 			hashrings, _ := ctrl.generate(test.tracker.state)
 			if !reflect.DeepEqual(hashrings, test.expected) {

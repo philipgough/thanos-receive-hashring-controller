@@ -2,12 +2,10 @@ package controller
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -44,10 +42,10 @@ type tracker struct {
 	// now is a function that returns the current time
 	// it is used to allow for testing
 	now    func() time.Time
-	logger log.Logger
+	logger *slog.Logger
 }
 
-func newTracker(ttl *time.Duration, logger log.Logger) *tracker {
+func newTracker(ttl *time.Duration, logger *slog.Logger) *tracker {
 	return &tracker{
 		ttl:    ttl,
 		state:  make(map[cacheKey]ownerRefTracker),
@@ -85,7 +83,7 @@ func (t *tracker) saveOrMerge(eps *discoveryv1.EndpointSlice) error {
 
 	// remove terminating Pods from the stored hashring
 	for _, hostname := range terminatingPods {
-		level.Info(t.logger).Log("msg", "evicting terminating endpoint from hashring",
+		t.logger.Info("evicting terminating endpoint from hashring",
 			"endpoint", hostname, "hashring", key, "subKey", subKey)
 		delete(existingStoredState.endpoints, hostname)
 	}
@@ -95,7 +93,7 @@ func (t *tracker) saveOrMerge(eps *discoveryv1.EndpointSlice) error {
 		if v.Before(now) {
 			// check if the entry has been refreshed in this update
 			if _, ok := updatedState.endpoints[k]; !ok {
-				level.Info(t.logger).Log("msg", "evicting expired endpoint from hashring",
+				t.logger.Info("evicting expired endpoint from hashring",
 					"endpoint", k, "hashring", key, "subKey", subKey)
 				delete(existingStoredState.endpoints, k)
 			}
@@ -130,12 +128,12 @@ func (t *tracker) evict(eps *discoveryv1.EndpointSlice) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	level.Info(t.logger).Log("msg", "evicting hashring shard", "hashring", key, "shard", subKey)
+	t.logger.Info("evicting hashring shard", "hashring", key, "shard", subKey)
 	// remove this shard
 	delete(state, subKey)
 	// check if we have any shards left
 	if len(state) == 0 {
-		level.Info(t.logger).Log("msg", "evicting hashring", "hashring", key)
+		t.logger.Info("evicting hashring", "hashring", key)
 		// delete the hashring entirely if not
 		delete(t.state, key)
 	}
@@ -217,8 +215,7 @@ func (t *tracker) toHashring(eps *discoveryv1.EndpointSlice) (*hashring, []strin
 
 	for _, endpoint := range eps.Endpoints {
 		if endpoint.Hostname == nil {
-			level.Warn(t.logger).Log(
-				"msg", "EndpointSlice endpoint has no hostname - skipping", "endpoint", endpoint)
+			t.logger.Warn("EndpointSlice endpoint has no hostname - skipping", "endpoint", endpoint)
 			continue
 		}
 

@@ -2,12 +2,13 @@ package controller
 
 import (
 	"fmt"
-	"github.com/go-kit/log"
+	"log/slog"
+	"testing"
+	"time"
+
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
-	"testing"
-	"time"
 )
 
 func TestSaveOrMerge(t *testing.T) {
@@ -333,7 +334,7 @@ func TestSaveOrMerge(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.tracker.logger = log.NewNopLogger()
+			tt.tracker.logger = slog.Default()
 			err := tt.tracker.saveOrMerge(tt.args.eps)
 			if err != nil {
 				t.Errorf("tracker.saveOrMerge() error = %v", err)

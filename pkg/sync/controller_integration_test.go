@@ -5,11 +5,11 @@ package sync
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/philipgough/hashring-controller/pkg/controller"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -104,7 +104,7 @@ func runController(t *testing.T, ctx context.Context, cfg *rest.Config, namespac
 		configMapInformer.Core().V1().ConfigMaps(),
 		kubeClient,
 		namespace,
-		log.NewNopLogger(),
+		slog.Default(),
 		prometheus.NewRegistry(),
 		Options{
 			ConfigMapKey:  controller.DefaultConfigMapKey,
