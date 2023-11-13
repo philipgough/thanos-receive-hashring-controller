@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/philipgough/hashring-controller/pkg/config"
@@ -200,15 +201,21 @@ func NewController(
 	return c
 }
 
-// EnsureConfigMapExists ensures that the controller's configmap exists or tries to create it with an empty hashring
-func (c *Controller) EnsureConfigMapExists(ctx context.Context) error {
+// EnsureConfigMapExists ensures that the controller's configmap exists or tries to create it with
+// the provided replica count.
+func (c *Controller) EnsureConfigMapExists(ctx context.Context, endpointName string, replicaCount int) error {
 	var pollError error
 	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, time.Minute, false, func(ctx context.Context) (bool, error) {
 		_, err := c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, c.configMapName, metav1.GetOptions{})
 		if err != nil {
 			if errors.IsNotFound(err) {
+				var endpoints string
+				for i := 0; i < replicaCount; i++ {
+					endpoints = endpoints + fmt.Sprintf(`"%s-%d.%s.%s.svc.%s:%s",`, endpointName, i, endpointName, c.namespace, c.clusterDomain, c.port)
+				}
+				data := fmt.Sprintf(`[{"hashring":"default","endpoints":[%s],"tenants":[]}]`, strings.TrimSuffix(endpoints, ","))
 				_, pollError = c.client.CoreV1().ConfigMaps(c.namespace).Create(
-					ctx, c.newConfigMap(`[{"hashring":"default","endpoints":[],"tenants":[]}]`, nil), metav1.CreateOptions{})
+					ctx, c.newConfigMap(data, nil), metav1.CreateOptions{})
 				return false, nil
 			}
 		}
