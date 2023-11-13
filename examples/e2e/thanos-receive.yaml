@@ -38,6 +38,8 @@ metadata:
   name: thanos-receive-hashring
   labels:
     app: thanos-receive
+    hashring.controller.io/watch: 'true'
+    hashring.controller.io/hashring: 'endpointslice'
 spec:
   selector:
     app: thanos-receive
@@ -90,7 +92,7 @@ spec:
       app: thanos-receive
   serviceName: thanos-receive-hashring
   replicas: 3
-  minReadySeconds: 60
+  minReadySeconds: 120
   template:
     metadata:
       labels:
@@ -185,7 +187,7 @@ spec:
             - name: hashring-config
               mountPath: /var/lib/thanos-receive
           terminationMessagePolicy: FallbackToLogsOnError
-          image: 'quay.io/thanos/thanos:v0.30.2'
+          image: 'quay.io/thanos/thanos:v0.32.5'
           args:
             - receive
             - '--log.level=info'
