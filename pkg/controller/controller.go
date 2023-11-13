@@ -31,7 +31,7 @@ import (
 
 const (
 	// ServiceLabel *must* be set to 'true' on a corev1.Service that should be watched by the Controller
-	ServiceLabel = "thanos.receive.hashring.controller/watch"
+	ServiceLabel = "hashring.controller.io/watch"
 	// HashringNameIdentifierLabel is an optional label that is used by the controller to identify the hashring name.
 	// A missing/empty value defaults to the name of the Service.
 	HashringNameIdentifierLabel = "hashring.controller.io/hashring"
