@@ -171,15 +171,6 @@ func NewController(
 
 	c.buildFQDN = c.defaultBuildFQDN
 
-	endpointSliceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    c.onEndpointSliceAdd,
-		UpdateFunc: c.onEndpointSliceUpdate,
-		DeleteFunc: c.onEndpointSliceDelete,
-	})
-
-	c.endpointSliceLister = endpointSliceInformer.Lister()
-	c.endpointSlicesSynced = endpointSliceInformer.Informer().HasSynced
-
 	configMapInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.handleObject,
 		UpdateFunc: func(old, new interface{}) {
@@ -197,6 +188,15 @@ func NewController(
 
 	c.configMapLister = configMapInformer.Lister()
 	c.configMapSynced = configMapInformer.Informer().HasSynced
+
+	endpointSliceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.onEndpointSliceAdd,
+		UpdateFunc: c.onEndpointSliceUpdate,
+		DeleteFunc: c.onEndpointSliceDelete,
+	})
+
+	c.endpointSliceLister = endpointSliceInformer.Lister()
+	c.endpointSlicesSynced = endpointSliceInformer.Informer().HasSynced
 
 	return c
 }
