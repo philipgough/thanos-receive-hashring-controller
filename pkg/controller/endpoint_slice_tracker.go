@@ -41,16 +41,23 @@ type tracker struct {
 	state map[cacheKey]ownerRefTracker
 	// now is a function that returns the current time
 	// it is used to allow for testing
-	now    func() time.Time
-	logger *slog.Logger
+	now             func() time.Time
+	endpointBuilder EndpointBuilderFN
+	config          Config
+	logger          *slog.Logger
 }
 
-func newTracker(ttl *time.Duration, logger *slog.Logger) *tracker {
+func newTracker(ttl *time.Duration, logger *slog.Logger, endpointBuilder EndpointBuilderFN) *tracker {
+	if endpointBuilder == nil {
+		defaultPort := 10901
+		endpointBuilder = DefaultEndpointBuilder(&defaultPort)
+	}
 	return &tracker{
-		ttl:    ttl,
-		state:  make(map[cacheKey]ownerRefTracker),
-		now:    time.Now,
-		logger: logger,
+		ttl:             ttl,
+		state:           make(map[cacheKey]ownerRefTracker),
+		now:             time.Now,
+		logger:          logger,
+		endpointBuilder: endpointBuilder,
 	}
 }
 
@@ -82,10 +89,10 @@ func (t *tracker) saveOrMerge(eps *discoveryv1.EndpointSlice) error {
 	}
 
 	// remove terminating Pods from the stored hashring
-	for _, hostname := range terminatingPods {
+	for _, endpoint := range terminatingPods {
 		t.logger.Info("evicting terminating endpoint from hashring",
-			"endpoint", hostname, "hashring", key, "subKey", subKey)
-		delete(existingStoredState.endpoints, hostname)
+			"endpoint", endpoint, "hashring", key, "subKey", subKey)
+		delete(existingStoredState.endpoints, endpoint)
 	}
 
 	now := t.now()
@@ -214,21 +221,22 @@ func (t *tracker) toHashring(eps *discoveryv1.EndpointSlice) (*hashring, []strin
 	}
 
 	for _, endpoint := range eps.Endpoints {
-		if endpoint.Hostname == nil {
-			t.logger.Warn("EndpointSlice endpoint has no hostname - skipping", "endpoint", endpoint)
+		ep, err := t.endpointBuilder(endpoint, eps)
+		if err != nil {
+			t.logger.Warn("EndpointSlice endpoint has no hostname - skipping", "endpoint", endpoint.String())
 			continue
 		}
 
 		if endpoint.Conditions.Terminating != nil && *endpoint.Conditions.Terminating == true {
 			// this is a voluntary disruption, so we should remove it from the hashring
 			// it might be an indication of a scale down event or rolling update etc
-			terminatingPods = append(terminatingPods, *endpoint.Hostname)
+			terminatingPods = append(terminatingPods, ep)
 			continue
 		}
 
 		// we only care about ready endpoints in terms of adding nodes to the hashring
 		if endpoint.Conditions.Ready != nil && *endpoint.Conditions.Ready == true {
-			endpoints[*endpoint.Hostname] = ttl
+			endpoints[ep] = ttl
 		}
 	}
 
@@ -268,11 +276,19 @@ func (t *tracker) getHashringName(eps *discoveryv1.EndpointSlice) (string, bool)
 }
 
 func (t *tracker) getTenants(eps *discoveryv1.EndpointSlice) []string {
-	tenant, ok := eps.GetLabels()[TenantIdentifierLabel]
-	if !ok {
-		return []string{}
+	// preconfigured tenants take precedence
+	hashringName, _ := t.getHashringName(eps)
+	if preconfiguredTenants, ok := t.config.HashringTenants[hashringName]; ok {
+		return preconfiguredTenants
 	}
-	return []string{tenant}
+	// otherwise we fall back to the tenant label
+	tenant, ok := eps.GetLabels()[TenantIdentifierLabel]
+	if ok {
+		return []string{tenant}
+	}
+
+	// lastly we fall back to the soft tenancy for all tenants
+	return []string{}
 }
 
 func (t *tracker) toSubKey(eps *discoveryv1.EndpointSlice) ownerRefUID {

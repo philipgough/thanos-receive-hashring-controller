@@ -97,7 +97,19 @@ func TestCreatesConfigMap(t *testing.T) {
 	f.endpointSliceLister = append(f.endpointSliceLister, eps)
 	f.objects = append(f.objects, eps)
 
-	ctrl := &Controller{configMapName: DefaultConfigMapName, namespace: metav1.NamespaceDefault}
+	ctrl := &Controller{
+		configMapName: DefaultConfigMapName,
+		namespace:     metav1.NamespaceDefault,
+		tracker: &tracker{
+			ttl:             nil,
+			mut:             sync.RWMutex{},
+			state:           nil,
+			now:             nil,
+			endpointBuilder: nil,
+			config:          Config{},
+			logger:          nil,
+		},
+	}
 	expectData := hashringsAsStringData(t, config.Hashrings{
 		{
 			HashringSpec: config.HashringSpec{
@@ -105,8 +117,8 @@ func TestCreatesConfigMap(t *testing.T) {
 				Tenants: []string{},
 			},
 			Endpoints: []string{
-				"test1." + testServiceName + ".default.svc.cluster.local:10901",
-				"test2." + testServiceName + ".default.svc.cluster.local:10901",
+				"test1." + testServiceName + ":10901",
+				"test2." + testServiceName + ":10901",
 			},
 		},
 	})
@@ -154,9 +166,9 @@ func TestUpdatesConfigMap(t *testing.T) {
 				Tenants: []string{},
 			},
 			Endpoints: []string{
-				"hello." + testServiceName + ".default.svc.cluster.local:10901",
-				"test1." + testServiceName + ".default.svc.cluster.local:10901",
-				"test2." + testServiceName + ".default.svc.cluster.local:10901",
+				"hello." + testServiceName + ":10901",
+				"test1." + testServiceName + ":10901",
+				"test2." + testServiceName + ":10901",
 			},
 		},
 	})
@@ -187,8 +199,8 @@ func TestUpdateConfigMapWithNotReady(t *testing.T) {
 				Tenants: []string{},
 			},
 			Endpoints: []string{
-				"test1." + testServiceName + ".default.svc.cluster.local:10901",
-				"test2." + testServiceName + ".default.svc.cluster.local:10901",
+				"test1." + testServiceName + ":10901",
+				"test2." + testServiceName + ":10901",
 			},
 		},
 	})
@@ -217,8 +229,8 @@ func TestUpdateConfigMapWithNotReady(t *testing.T) {
 				Tenants: []string{},
 			},
 			Endpoints: []string{
-				"hello." + testServiceName + ".default.svc.cluster.local:10901",
-				"test2." + testServiceName + ".default.svc.cluster.local:10901",
+				"hello." + testServiceName + ":10901",
+				"test2." + testServiceName + ":10901",
 			},
 		},
 	})
@@ -255,6 +267,8 @@ func (f *fixture) newController(ctx context.Context) (*Controller, informers.Sha
 		slog.Default(),
 		prometheus.NewRegistry(),
 	)
+
+	c.tracker = newTracker(nil, slog.Default(), nil)
 
 	if f.cache != nil {
 		c.tracker = f.cache
@@ -493,12 +507,13 @@ func TestControllerGenerate(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			tracker := test.tracker
+			tracker.endpointBuilder = func(ep discoveryv1.Endpoint, eps *discoveryv1.EndpointSlice) (string, error) {
+				return *ep.Hostname, nil
+			}
 			ctrl := &Controller{
 				tracker: test.tracker,
-				buildFQDN: func(hostname, svc string) string {
-					return hostname
-				},
-				logger: slog.Default(),
+				logger:  slog.Default(),
 			}
 			hashrings, _ := ctrl.generate(test.tracker.state)
 			if !reflect.DeepEqual(hashrings, test.expected) {

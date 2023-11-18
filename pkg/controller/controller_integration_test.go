@@ -82,7 +82,7 @@ func TestCreateUpdateDeleteCycleNoCache(t *testing.T) {
 	}
 
 	// Assert that the correct data exists in the hashring-config ConfigMap
-	expectThisTime := `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.headless-svc.test-no-cache-ns.svc.cluster.local:10901","test-hostname.headless-svc.test-no-cache-ns.svc.cluster.local:10901"]}]`
+	expectThisTime := `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.headless-svc:10901","test-hostname.headless-svc:10901"]}]`
 	if err := pollUntilExpectConfigurationOrTimeout(t, ctx, ns, expectThisTime, k8sClient); err != nil {
 		t.Fatalf("failed to assert EndpointSlice state: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestCreateUpdateDeleteCycleNoCache(t *testing.T) {
 	}
 
 	// Assert that the correct data exists in the hashring-config ConfigMap
-	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.headless-svc.test-no-cache-ns.svc.cluster.local:10901","test-hostname.headless-svc.test-no-cache-ns.svc.cluster.local:10901"]},{"hashring":"hashring-two","tenants":["hard-tenant"],"endpoints":["test-host-1.hashring-two.test-no-cache-ns.svc.cluster.local:10901","test-host.hashring-two.test-no-cache-ns.svc.cluster.local:10901"]}]`
+	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.headless-svc:10901","test-hostname.headless-svc:10901"]},{"hashring":"hashring-two","tenants":["hard-tenant"],"endpoints":["test-host-1.hashring-two:10901","test-host.hashring-two:10901"]}]`
 	if err := pollUntilExpectConfigurationOrTimeout(t, ctx, ns, expectThisTime, k8sClient); err != nil {
 		t.Fatalf("failed to assert EndpointSlice state: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestCreateUpdateDeleteCycleNoCache(t *testing.T) {
 	}
 
 	// Assert that the correct data exists in the hashring-config ConfigMap
-	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.headless-svc.test-no-cache-ns.svc.cluster.local:10901"]},{"hashring":"hashring-two","tenants":["hard-tenant"],"endpoints":["test-host-1.hashring-two.test-no-cache-ns.svc.cluster.local:10901"]}]`
+	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.headless-svc:10901"]},{"hashring":"hashring-two","tenants":["hard-tenant"],"endpoints":["test-host-1.hashring-two:10901"]}]`
 	if err := pollUntilExpectConfigurationOrTimeout(t, ctx, ns, expectThisTime, k8sClient); err != nil {
 		t.Fatalf("failed to assert EndpointSlice state: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestCreateUpdateDeleteCycleNoCache(t *testing.T) {
 	}
 
 	// Assert that the correct data exists in the hashring-config ConfigMap
-	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.headless-svc.test-no-cache-ns.svc.cluster.local:10901"]}]`
+	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.headless-svc:10901"]}]`
 	if err := pollUntilExpectConfigurationOrTimeout(t, ctx, ns, expectThisTime, k8sClient); err != nil {
 		t.Fatalf("failed to assert EndpointSlice state: %v", err)
 	}
@@ -167,7 +167,6 @@ func TestCreateUpdateDeleteCycleWithCache(t *testing.T) {
 	defer cancel()
 
 	testEnv := &envtest.Environment{}
-
 	// start the test environment
 	cfg, err := testEnv.Start()
 	if err != nil {
@@ -213,7 +212,7 @@ func TestCreateUpdateDeleteCycleWithCache(t *testing.T) {
 	}
 
 	// Assert that the correct data exists in the hashring-config ConfigMap
-	expectThisTime := `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.hashring-one.test-cache-ns.svc.cluster.local:10901","test-hostname.hashring-one.test-cache-ns.svc.cluster.local:10901"]}]`
+	expectThisTime := `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.hashring-one:10901","test-hostname.hashring-one:10901"]}]`
 	if err := pollUntilExpectConfigurationOrTimeout(t, ctx, ns, expectThisTime, k8sClient); err != nil {
 		t.Fatalf("failed to assert EndpointSlice state: %v", err)
 	}
@@ -255,7 +254,7 @@ func TestCreateUpdateDeleteCycleWithCache(t *testing.T) {
 	}
 
 	// Assert that the correct data exists in the hashring-config ConfigMap
-	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.hashring-one.test-cache-ns.svc.cluster.local:10901","test-hostname.hashring-one.test-cache-ns.svc.cluster.local:10901"]},{"hashring":"hashring-two","tenants":["hard-tenant"],"endpoints":["test-host-1.hashring-two.test-cache-ns.svc.cluster.local:10901","test-host.hashring-two.test-cache-ns.svc.cluster.local:10901"]}]`
+	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.hashring-one:10901","test-hostname.hashring-one:10901"]},{"hashring":"hashring-two","tenants":["hard-tenant"],"endpoints":["test-host-1.hashring-two:10901","test-host.hashring-two:10901"]}]`
 	if err := pollUntilExpectConfigurationOrTimeout(t, ctx, ns, expectThisTime, k8sClient); err != nil {
 		t.Fatalf("failed to assert EndpointSlice state: %v", err)
 	}
@@ -271,7 +270,7 @@ func TestCreateUpdateDeleteCycleWithCache(t *testing.T) {
 	}
 
 	// Assert that the correct data exists in the hashring-config ConfigMap
-	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.hashring-one.test-cache-ns.svc.cluster.local:10901","test-hostname.hashring-one.test-cache-ns.svc.cluster.local:10901"]},{"hashring":"hashring-two","tenants":["hard-tenant"],"endpoints":["test-host-1.hashring-two.test-cache-ns.svc.cluster.local:10901"]}]`
+	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.hashring-one:10901","test-hostname.hashring-one:10901"]},{"hashring":"hashring-two","tenants":["hard-tenant"],"endpoints":["test-host-1.hashring-two:10901"]}]`
 	if err := pollUntilExpectConfigurationOrTimeout(t, ctx, ns, expectThisTime, k8sClient); err != nil {
 		t.Fatalf("failed to assert EndpointSlice state: %v", err)
 	}
@@ -281,7 +280,7 @@ func TestCreateUpdateDeleteCycleWithCache(t *testing.T) {
 	}
 
 	// Assert that the correct data exists in the hashring-config ConfigMap
-	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.hashring-one.test-cache-ns.svc.cluster.local:10901","test-hostname.hashring-one.test-cache-ns.svc.cluster.local:10901"]}]`
+	expectThisTime = `[{"hashring":"hashring-one","tenants":[],"endpoints":["test-hostname-1.hashring-one:10901","test-hostname.hashring-one:10901"]}]`
 	if err := pollUntilExpectConfigurationOrTimeout(t, ctx, ns, expectThisTime, k8sClient); err != nil {
 		t.Fatalf("failed to assert EndpointSlice state: %v", err)
 	}
@@ -327,7 +326,7 @@ func runController(t *testing.T, ctx context.Context, cfg *rest.Config, namespac
 		time.Second*30,
 		kubeinformers.WithNamespace(namespace),
 		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{ServiceLabel: "true"}.String()
+			options.LabelSelector = labels.Set{DefaultServiceLabel: "true"}.String()
 		}),
 	)
 
@@ -336,7 +335,7 @@ func runController(t *testing.T, ctx context.Context, cfg *rest.Config, namespac
 		time.Second*30,
 		kubeinformers.WithNamespace(namespace),
 		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{ConfigMapLabel: "true"}.String()
+			options.LabelSelector = labels.Set{DefaultConfigMapLabel: "true"}.String()
 		}),
 	)
 
@@ -375,7 +374,7 @@ func buildEndpointSlice(t *testing.T, namespace, name, hashringName, serviceName
 			Name:      name,
 			Namespace: namespace,
 			Labels: map[string]string{
-				ServiceLabel:                 "true",
+				DefaultServiceLabel:          "true",
 				HashringNameIdentifierLabel:  hashringName,
 				discoveryv1.LabelServiceName: serviceName,
 			},

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/philipgough/hashring-controller/pkg/config"
@@ -31,8 +30,21 @@ import (
 )
 
 const (
-	// ServiceLabel *must* be set to 'true' on a corev1.Service that should be watched by the Controller
-	ServiceLabel = "hashring.controller.io/watch"
+	// DefaultServiceLabel is the default label that marks that headless Service.
+	// should be watched by the Controller. The value of the label must be "true".
+	DefaultServiceLabel = "endpointslice.controller.io/watch"
+	// DefaultConfigMapName is the default name for the generated ConfigMap.
+	DefaultConfigMapName = "endpointslice-controller-generated-config"
+	// DefaultConfigMapLabel is the default label that is used to identify ConfigMaps that are managed by the controller.
+	DefaultConfigMapLabel = "endpointslice.controller.io/managed"
+	// DefaultConfigMapKey is the default key for data insertion on the generated ConfigMap.
+	DefaultConfigMapKey = "data.json"
+
+	// defaultSyncBackOff is the default backoff period for syncService calls.
+	defaultSyncBackOff = 1 * time.Second
+	// maxSyncBackOff is the max backoff period for sync calls.
+	maxSyncBackOff = 1000 * time.Second
+
 	// HashringNameIdentifierLabel is an optional label that is used by the controller to identify the hashring name.
 	// A missing/empty value defaults to the name of the Service.
 	HashringNameIdentifierLabel = "hashring.controller.io/hashring"
@@ -44,22 +56,48 @@ const (
 	// When relying on default behaviour for the controller, the absence of this label
 	// on a Service will result in the use of config.DefaultAlgorithm
 	AlgorithmIdentifierLabel = "hashring.controller.io/hashing-algorithm"
-
-	// DefaultConfigMapName is the default name for the generated ConfigMap
-	DefaultConfigMapName = "hashring-controller-generated-config"
-	// ConfigMapLabel is the label that is used to identify configmaps that is managed by the controller
-	ConfigMapLabel = "hashring.controller.io/managed"
-
-	// DefaultConfigMapKey is the default key for the generated ConfigMap
-	DefaultConfigMapKey  = "hashrings.json"
-	defaultPort          = "10901"
-	defaultClusterDomain = "cluster.local"
-
-	// defaultSyncBackOff is the default backoff period for syncService calls.
-	defaultSyncBackOff = 1 * time.Second
-	// maxSyncBackOff is the max backoff period for sync calls.
-	maxSyncBackOff = 1000 * time.Second
 )
+
+var defaultPort = 10901
+
+// HashringTenants is a map of hashring names to tenants.
+// It can be used in situations where the tenant cannot be inferred from the
+// controller.TenantIdentifierLabel and more where more control is required.
+type HashringTenants map[string][]string
+
+// EndpointBuilderFN is a function that builds an endpoint from an Endpoint and an EndpointSlice
+type EndpointBuilderFN func(ep discoveryv1.Endpoint, eps *discoveryv1.EndpointSlice) (string, error)
+
+// Config provides a way to override default controller behaviour.
+type Config struct {
+	HashringTenants HashringTenants
+	EndpointBuilder EndpointBuilderFN
+}
+
+// DefaultEndpointBuilder builds the endpoint for a given Endpoint and EndpointSlice.
+// This implementation assumes endpoints are backed by a Service within the same namespace.
+// https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#stable-network-id
+func DefaultEndpointBuilder(port *int) EndpointBuilderFN {
+	return func(ep discoveryv1.Endpoint, eps *discoveryv1.EndpointSlice) (string, error) {
+		if eps == nil {
+			return "", fmt.Errorf("nil EndpointSlice provided")
+		}
+
+		svc := eps.GetLabels()[discoveryv1.LabelServiceName]
+		if svc == "" {
+			return "", fmt.Errorf("missing service name label on EndpointSlice %s/%s", eps.Namespace, eps.Name)
+		}
+		if ep.Hostname == nil || *ep.Hostname == "" {
+			return "", fmt.Errorf("missing required hostname on Endpoint")
+		}
+
+		hostname := fmt.Sprintf("%s.%s", *ep.Hostname, svc)
+		if port != nil {
+			hostname = fmt.Sprintf("%s:%d", hostname, *port)
+		}
+		return hostname, nil
+	}
+}
 
 // Controller manages selector-based service endpoint slices
 type Controller struct {
@@ -104,8 +142,6 @@ type Controller struct {
 	clusterDomain string
 	// namespace is the namespace of the configmap that the controller will generate
 	namespace string
-	// buildFQDN is a function that builds a FQDN from a hostname and a service name
-	buildFQDN func(hostname, serviceName string) string
 	logger    *slog.Logger
 	metrics   *metrics
 }
@@ -121,10 +157,14 @@ type Options struct {
 	ConfigMapKey *string
 	// ConfigMapName is the name of the generated ConfigMap
 	ConfigMapName *string
-	// Port is the port that the hashring will be generated for
-	Port *string
-	// ClusterDomain is the cluster domain that the hashring will be generated for
-	ClusterDomain *string
+}
+
+func DefaultOptions() *Options {
+	return &Options{
+		TTL:           nil,
+		ConfigMapName: pointer.String(DefaultConfigMapName),
+		ConfigMapKey:  pointer.String(DefaultConfigMapKey),
+	}
 }
 
 func NewController(
@@ -148,8 +188,6 @@ func NewController(
 		client:        client,
 		configMapName: *opts.ConfigMapName,
 		configMapKey:  *opts.ConfigMapKey,
-		port:          *opts.Port,
-		clusterDomain: *opts.ClusterDomain,
 		// This is similar to the DefaultControllerRateLimiter, just with a
 		// significantly higher default backoff (1s vs 5ms). A more significant
 		// rate limit back off here helps ensure that the Controller does not
@@ -164,12 +202,10 @@ func NewController(
 			workqueue.RateLimitingQueueConfig{Name: "endpoint_slice"}),
 		workerLoopPeriod: time.Second,
 		namespace:        namespace,
-		tracker:          newTracker(opts.TTL, logger.With("component", "endpointslice_tracker")),
+		tracker:          newTracker(opts.TTL, logger.With("component", "endpointslice_tracker"), DefaultEndpointBuilder(&defaultPort)),
 		logger:           logger,
 		metrics:          ctrlMetrics,
 	}
-
-	c.buildFQDN = c.defaultBuildFQDN
 
 	configMapInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.handleObject,
@@ -203,19 +239,16 @@ func NewController(
 
 // EnsureConfigMapExists ensures that the controller's configmap exists or tries to create it with
 // the provided replica count.
-func (c *Controller) EnsureConfigMapExists(ctx context.Context, endpointName string, replicaCount int) error {
+func (c *Controller) EnsureConfigMapExists(ctx context.Context) error {
 	var pollError error
 	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, time.Minute, false, func(ctx context.Context) (bool, error) {
 		_, err := c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, c.configMapName, metav1.GetOptions{})
 		if err != nil {
+
 			if errors.IsNotFound(err) {
-				var endpoints string
-				for i := 0; i < replicaCount; i++ {
-					endpoints = endpoints + fmt.Sprintf(`"%s-%d.%s.%s.svc.%s:%s",`, endpointName, i, endpointName, c.namespace, c.clusterDomain, c.port)
-				}
-				data := fmt.Sprintf(`[{"hashring":"default","endpoints":[%s],"tenants":[]}]`, strings.TrimSuffix(endpoints, ","))
-				_, pollError = c.client.CoreV1().ConfigMaps(c.namespace).Create(
-					ctx, c.newConfigMap(data, nil), metav1.CreateOptions{})
+				data := `[{"hashring":"default","endpoints":[%s],"tenants":[]}]`
+				_, pollError = c.client.CoreV1().ConfigMaps(c.namespace).
+					Create(ctx, c.newConfigMap(data, nil), metav1.CreateOptions{})
 				return false, nil
 			}
 		}
@@ -348,7 +381,8 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		return err
 	}
 
-	if err := c.tracker.saveOrMerge(eps); err != nil {
+	epsCopied := eps.DeepCopy()
+	if err := c.tracker.saveOrMerge(epsCopied); err != nil {
 		utilruntime.HandleError(fmt.Errorf("syncHandler failed to reconcile resource key: %s", key))
 		return err
 	}
@@ -436,7 +470,7 @@ func (c *Controller) newConfigMap(data string, owners []metav1.OwnerReference) *
 			Name:      c.configMapName,
 			Namespace: c.namespace,
 			Labels: map[string]string{
-				ConfigMapLabel: "true",
+				DefaultConfigMapLabel: "true",
 			},
 			OwnerReferences: owners,
 		},
@@ -475,7 +509,7 @@ func (c *Controller) deduplicateAndSortByOwnerRef(svc string, ownerRefs ownerRef
 
 	endpoints = make([]string, 0, len(aggregatedEndpoints))
 	for endpoint, _ := range aggregatedEndpoints {
-		endpoints = append(endpoints, c.buildFQDN(endpoint, svc))
+		endpoints = append(endpoints, endpoint)
 	}
 
 	tenants = make([]string, 0, len(aggregatedTenants))
@@ -486,13 +520,6 @@ func (c *Controller) deduplicateAndSortByOwnerRef(svc string, ownerRefs ownerRef
 	sort.Strings(endpoints)
 	sort.Strings(tenants)
 	return tenants, endpoints
-}
-
-// defaultBuildFQDN builds the FQDN for a given hostname
-// https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#stable-network-id
-func (c *Controller) defaultBuildFQDN(hostname, serviceName string) string {
-	return fmt.Sprintf("%s.%s.%s.svc.%s:%s",
-		hostname, serviceName, c.namespace, defaultClusterDomain, defaultPort)
 }
 
 func (c *Controller) onEndpointSliceAdd(obj interface{}) {
@@ -597,8 +624,6 @@ func buildOpts(o *Options) *Options {
 			TTL:           nil,
 			ConfigMapName: pointer.String(DefaultConfigMapName),
 			ConfigMapKey:  pointer.String(DefaultConfigMapKey),
-			Port:          pointer.String(defaultPort),
-			ClusterDomain: pointer.String(defaultClusterDomain),
 		}
 		return o
 	}
@@ -609,12 +634,5 @@ func buildOpts(o *Options) *Options {
 	if o.ConfigMapKey == nil {
 		o.ConfigMapKey = pointer.String(DefaultConfigMapKey)
 	}
-	if o.Port == nil {
-		o.Port = pointer.String(defaultPort)
-	}
-	if o.ClusterDomain == nil {
-		o.ClusterDomain = pointer.String(defaultClusterDomain)
-	}
-
 	return o
 }

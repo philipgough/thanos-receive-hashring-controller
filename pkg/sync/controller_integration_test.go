@@ -95,7 +95,7 @@ func runController(t *testing.T, ctx context.Context, cfg *rest.Config, namespac
 		time.Second*30,
 		kubeinformers.WithNamespace(namespace),
 		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{controller.ConfigMapLabel: "true"}.String()
+			options.LabelSelector = labels.Set{controller.DefaultConfigMapLabel: "true"}.String()
 		}),
 	)
 
@@ -132,7 +132,7 @@ func buildConfigMap(t *testing.T, namespace, name, hashringName, endpoints, tena
 			Name:      name,
 			Namespace: namespace,
 			Labels: map[string]string{
-				controller.ConfigMapLabel: "true",
+				controller.DefaultConfigMapLabel: "true",
 			},
 		},
 		Data: map[string]string{

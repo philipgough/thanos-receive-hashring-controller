@@ -66,8 +66,8 @@ func TestSaveOrMerge(t *testing.T) {
 				nested["test/blaa"] = &hashring{
 					tenants: []string{defaultTenant},
 					endpoints: map[string]*time.Time{
-						"host-test":  nil,
-						"host-test1": nil,
+						"host-test.service1:10901":  nil,
+						"host-test1.service1:10901": nil,
 					},
 				}
 				state[defaultCacheKey] = nested
@@ -84,8 +84,8 @@ func TestSaveOrMerge(t *testing.T) {
 					nested["test/blaa"] = &hashring{
 						tenants: []string{defaultTenant},
 						endpoints: map[string]*time.Time{
-							"host-test":  nil,
-							"host-test1": nil,
+							"host-test.service1:10901":  nil,
+							"host-test1.service1:10901": nil,
 						},
 					}
 					state[defaultCacheKey] = nested
@@ -119,7 +119,7 @@ func TestSaveOrMerge(t *testing.T) {
 				nested["test/blaa"] = &hashring{
 					tenants: []string{defaultTenant},
 					endpoints: map[string]*time.Time{
-						"host-test1": nil,
+						"host-test1.service1:10901": nil,
 					},
 				}
 				state[defaultCacheKey] = nested
@@ -164,8 +164,8 @@ func TestSaveOrMerge(t *testing.T) {
 				nested["test/blaa"] = &hashring{
 					tenants: []string{defaultTenant},
 					endpoints: map[string]*time.Time{
-						"host-test":  &expectOneHour,
-						"host-test1": &expectOneHour,
+						"host-test.service1:10901":  &expectOneHour,
+						"host-test1.service1:10901": &expectOneHour,
 					},
 				}
 				state[defaultCacheKey] = nested
@@ -185,8 +185,8 @@ func TestSaveOrMerge(t *testing.T) {
 					nested["test/blaa"] = &hashring{
 						tenants: []string{defaultTenant},
 						endpoints: map[string]*time.Time{
-							"host-test":  &expectOneHour,
-							"host-test1": &expectOneHour,
+							"host-test.service1:10901":  &expectOneHour,
+							"host-test1.service1:10901": &expectOneHour,
 						},
 					}
 					state[defaultCacheKey] = nested
@@ -220,8 +220,8 @@ func TestSaveOrMerge(t *testing.T) {
 				nested["test/blaa"] = &hashring{
 					tenants: []string{defaultTenant},
 					endpoints: map[string]*time.Time{
-						"host-test":  &expectOneHour,
-						"host-test1": &expectOneHour,
+						"host-test.service1:10901":  &expectOneHour,
+						"host-test1.service1:10901": &expectOneHour,
 					},
 				}
 				state[defaultCacheKey] = nested
@@ -241,8 +241,8 @@ func TestSaveOrMerge(t *testing.T) {
 					nested["test/blaa"] = &hashring{
 						tenants: []string{defaultTenant},
 						endpoints: map[string]*time.Time{
-							"host-test":  &now,
-							"host-test1": &now,
+							"host-test.service1:10901":  &now,
+							"host-test1.service1:10901": &now,
 						},
 					}
 					state[defaultCacheKey] = nested
@@ -276,7 +276,7 @@ func TestSaveOrMerge(t *testing.T) {
 				nested["test/blaa"] = &hashring{
 					tenants: []string{defaultTenant},
 					endpoints: map[string]*time.Time{
-						"host-test1": &expectUpdatedCacheTTL,
+						"host-test1.service1:10901": &expectUpdatedCacheTTL,
 					},
 				}
 				state[defaultCacheKey] = nested
@@ -323,8 +323,8 @@ func TestSaveOrMerge(t *testing.T) {
 				nested["test/blaa"] = &hashring{
 					tenants: []string{defaultTenant, "tenant2"},
 					endpoints: map[string]*time.Time{
-						"host-test":  nil,
-						"host-test1": nil,
+						"host-test.service1:10901":  nil,
+						"host-test1.service1:10901": nil,
 					},
 				}
 				state[defaultSVC+"/"+defaultSVC] = nested
@@ -334,7 +334,9 @@ func TestSaveOrMerge(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			port := 10901
 			tt.tracker.logger = slog.Default()
+			tt.tracker.endpointBuilder = DefaultEndpointBuilder(&port)
 			err := tt.tracker.saveOrMerge(tt.args.eps)
 			if err != nil {
 				t.Errorf("tracker.saveOrMerge() error = %v", err)
