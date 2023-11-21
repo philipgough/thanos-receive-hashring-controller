@@ -1,6 +1,6 @@
 //go:build integration
 
-package controller
+package thanos
 
 import (
 	"context"
@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/philipgough/hashring-controller/pkg/controller"
 	"github.com/prometheus/client_golang/prometheus"
 
 	corev1 "k8s.io/api/core/v1"
@@ -154,6 +155,7 @@ func TestCreateUpdateDeleteCycleNoCache(t *testing.T) {
 	if err := pollUntilExpectConfigurationOrTimeout(t, ctx, ns, expectThisTime, k8sClient); err != nil {
 		t.Fatalf("failed to assert EndpointSlice state: %v", err)
 	}
+
 }
 
 func TestCreateUpdateDeleteCycleWithCache(t *testing.T) {
@@ -294,13 +296,13 @@ func pollUntilExpectConfigurationOrTimeout(t *testing.T, ctx context.Context, ns
 	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 30*time.Second, false, func(ctx context.Context) (bool, error) {
 
 		cm := &corev1.ConfigMap{}
-		err := c.Get(ctx, client.ObjectKey{Name: DefaultConfigMapName, Namespace: ns}, cm)
+		err := c.Get(ctx, client.ObjectKey{Name: controller.DefaultConfigMapName, Namespace: ns}, cm)
 		if err != nil {
 			pollError = fmt.Errorf("failed to query configmap: %s", err)
 			return false, nil
 		}
 
-		if cm.Data[DefaultConfigMapKey] != expect {
+		if cm.Data[controller.DefaultConfigMapKey] != expect {
 			return false, nil
 		}
 
@@ -326,7 +328,7 @@ func runController(t *testing.T, ctx context.Context, cfg *rest.Config, namespac
 		time.Second*30,
 		kubeinformers.WithNamespace(namespace),
 		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{DefaultServiceLabel: "true"}.String()
+			options.LabelSelector = labels.Set{controller.DefaultServiceLabel: "true"}.String()
 		}),
 	)
 
@@ -335,22 +337,23 @@ func runController(t *testing.T, ctx context.Context, cfg *rest.Config, namespac
 		time.Second*30,
 		kubeinformers.WithNamespace(namespace),
 		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{DefaultConfigMapLabel: "true"}.String()
+			options.LabelSelector = labels.Set{controller.DefaultConfigMapLabel: "true"}.String()
 		}),
 	)
 
-	var opts *Options
+	var opts *controller.Options
 	if cacheTTL != nil {
-		opts = &Options{
+		opts = &controller.Options{
 			TTL: cacheTTL,
 		}
 	}
 
-	controller := NewController(
+	controller := controller.NewController(
 		ctx,
 		endpointSliceInformer.Discovery().V1().EndpointSlices(),
 		configMapInformer.Core().V1().ConfigMaps(),
 		kubeClient,
+		NewReceiveHashringController(nil, nil),
 		namespace,
 		opts,
 		slog.Default(),
@@ -374,9 +377,9 @@ func buildEndpointSlice(t *testing.T, namespace, name, hashringName, serviceName
 			Name:      name,
 			Namespace: namespace,
 			Labels: map[string]string{
-				DefaultServiceLabel:          "true",
-				HashringNameIdentifierLabel:  hashringName,
-				discoveryv1.LabelServiceName: serviceName,
+				controller.DefaultServiceLabel: "true",
+				HashringNameIdentifierLabel:    hashringName,
+				discoveryv1.LabelServiceName:   serviceName,
 			},
 		},
 		AddressType: discoveryv1.AddressTypeIPv4,

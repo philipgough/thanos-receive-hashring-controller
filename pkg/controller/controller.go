@@ -2,13 +2,10 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"sort"
 	"time"
 
-	"github.com/philipgough/hashring-controller/pkg/config"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"golang.org/x/time/rate"
@@ -29,12 +26,27 @@ import (
 	"k8s.io/utils/pointer"
 )
 
+// EndpointBuilderFN is a function that builds an endpoint string from an Endpoint and an EndpointSlice
+type EndpointBuilderFN func(eps *discoveryv1.EndpointSlice, ep discoveryv1.Endpoint) (string, error)
+
+type Trackable interface {
+	// EndpointBuilder builds the endpoint string for a given Endpoint.
+	EndpointBuilder() EndpointBuilderFN
+	// SetValueFor sets the value for the given EndpointSlice and Endpoints in the cache.
+	// validEndpoints is a list of Endpoints that are valid (as per the cache behaviour) for the given EndpointSlice.
+	SetValueFor(eps *discoveryv1.EndpointSlice, endpoints []string) (interface{}, error)
+	// Generate returns the value that will be set in the ConfigMap.
+	// A value is a group of EndpointSlices that share the same Service.
+	// The caller is responsible for ensuring data deduplication within the output if required.
+	Generate(values [][]interface{}) (string, error)
+}
+
 const (
 	// DefaultServiceLabel is the default label that marks that headless Service.
 	// should be watched by the Controller. The value of the label must be "true".
 	DefaultServiceLabel = "endpointslice.controller.io/watch"
 	// DefaultConfigMapName is the default name for the generated ConfigMap.
-	DefaultConfigMapName = "endpointslice-controller-generated-config"
+	DefaultConfigMapName = "hashring-controller-generated-config"
 	// DefaultConfigMapLabel is the default label that is used to identify ConfigMaps that are managed by the controller.
 	DefaultConfigMapLabel = "endpointslice.controller.io/managed"
 	// DefaultConfigMapKey is the default key for data insertion on the generated ConfigMap.
@@ -44,60 +56,7 @@ const (
 	defaultSyncBackOff = 1 * time.Second
 	// maxSyncBackOff is the max backoff period for sync calls.
 	maxSyncBackOff = 1000 * time.Second
-
-	// HashringNameIdentifierLabel is an optional label that is used by the controller to identify the hashring name.
-	// A missing/empty value defaults to the name of the Service.
-	HashringNameIdentifierLabel = "hashring.controller.io/hashring"
-	// TenantIdentifierLabel is an optional label that is used by the controller to identify a tenant for the hashring
-	// When relying on default behaviour for the controller, the absence of this label
-	// on a Service will result in an empty tenant list which matches all tenants providing soft-tenancy
-	TenantIdentifierLabel = "hashring.controller.io/tenant"
-	// AlgorithmIdentifierLabel is the label that is used by the controller to identify the hashring algorithm
-	// When relying on default behaviour for the controller, the absence of this label
-	// on a Service will result in the use of config.DefaultAlgorithm
-	AlgorithmIdentifierLabel = "hashring.controller.io/hashing-algorithm"
 )
-
-var defaultPort = 10901
-
-// HashringTenants is a map of hashring names to tenants.
-// It can be used in situations where the tenant cannot be inferred from the
-// controller.TenantIdentifierLabel and more where more control is required.
-type HashringTenants map[string][]string
-
-// EndpointBuilderFN is a function that builds an endpoint from an Endpoint and an EndpointSlice
-type EndpointBuilderFN func(ep discoveryv1.Endpoint, eps *discoveryv1.EndpointSlice) (string, error)
-
-// Config provides a way to override default controller behaviour.
-type Config struct {
-	HashringTenants HashringTenants
-	EndpointBuilder EndpointBuilderFN
-}
-
-// DefaultEndpointBuilder builds the endpoint for a given Endpoint and EndpointSlice.
-// This implementation assumes endpoints are backed by a Service within the same namespace.
-// https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#stable-network-id
-func DefaultEndpointBuilder(port *int) EndpointBuilderFN {
-	return func(ep discoveryv1.Endpoint, eps *discoveryv1.EndpointSlice) (string, error) {
-		if eps == nil {
-			return "", fmt.Errorf("nil EndpointSlice provided")
-		}
-
-		svc := eps.GetLabels()[discoveryv1.LabelServiceName]
-		if svc == "" {
-			return "", fmt.Errorf("missing service name label on EndpointSlice %s/%s", eps.Namespace, eps.Name)
-		}
-		if ep.Hostname == nil || *ep.Hostname == "" {
-			return "", fmt.Errorf("missing required hostname on Endpoint")
-		}
-
-		hostname := fmt.Sprintf("%s.%s", *ep.Hostname, svc)
-		if port != nil {
-			hostname = fmt.Sprintf("%s:%d", hostname, *port)
-		}
-		return hostname, nil
-	}
-}
 
 // Controller manages selector-based service endpoint slices
 type Controller struct {
@@ -131,16 +90,14 @@ type Controller struct {
 
 	//tracker is used to track the status of the controller
 	tracker *tracker
+	// trackable is the implementation of the Trackable interface that will be cached and generated
+	trackable Trackable
 
 	// configMapName is the name of the configmap that the controller will generate
 	configMapName string
 	// configMapKey is the key of the configmap that the controller will generate
 	configMapKey string
-	// port is the port that the controller will generate a hashring for
-	port string
-	// clusterDomain is the cluster domain that the controller will generate a hashring for
-	clusterDomain string
-	// namespace is the namespace of the configmap that the controller will generate
+	// namespace is the namespace that the controller will operate in
 	namespace string
 	logger    *slog.Logger
 	metrics   *metrics
@@ -172,6 +129,7 @@ func NewController(
 	endpointSliceInformer discoveryinformers.EndpointSliceInformer,
 	configMapInformer coreinformers.ConfigMapInformer,
 	client clientset.Interface,
+	trackable Trackable,
 	namespace string,
 	opts *Options,
 	logger *slog.Logger,
@@ -202,7 +160,7 @@ func NewController(
 			workqueue.RateLimitingQueueConfig{Name: "endpoint_slice"}),
 		workerLoopPeriod: time.Second,
 		namespace:        namespace,
-		tracker:          newTracker(opts.TTL, logger.With("component", "endpointslice_tracker"), DefaultEndpointBuilder(&defaultPort)),
+		tracker:          newTracker(opts.TTL, logger.With("component", "endpointslice_tracker"), trackable),
 		logger:           logger,
 		metrics:          ctrlMetrics,
 	}
@@ -392,17 +350,18 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 
 // reconcile compares the actual state with the desired, and attempts to converge the two.
 func (c *Controller) reconcile(ctx context.Context) error {
-	hashrings, owners := c.generate(c.tracker.deepCopyState())
-
-	hashringConfig, err := json.Marshal(hashrings)
+	output, owners, err := c.tracker.generate()
 	if err != nil {
-		return err
+		// we log and return here because we don't want to requeue the item
+		c.logger.Error("failed to generate output during reconcile", "error", err.Error())
+		return nil
 	}
+
 	// Get the ConfigMap or create it if it doesn't exist.
 	cm, err := c.configMapLister.ConfigMaps(c.namespace).Get(c.configMapName)
 	if errors.IsNotFound(err) {
 		cm, err = c.client.CoreV1().ConfigMaps(c.namespace).Create(ctx,
-			c.newConfigMap(string(hashringConfig), owners), metav1.CreateOptions{})
+			c.newConfigMap(output, owners), metav1.CreateOptions{})
 	}
 
 	// If an error occurs during Get/Create, we'll requeue the item so we can
@@ -412,9 +371,9 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		return err
 	}
 
-	if cm.Data[c.configMapKey] != string(hashringConfig) {
+	if cm.Data[c.configMapKey] != output {
 		_, err = c.client.CoreV1().ConfigMaps(c.namespace).Update(
-			ctx, c.newConfigMap(string(hashringConfig), owners), metav1.UpdateOptions{})
+			ctx, c.newConfigMap(output, owners), metav1.UpdateOptions{})
 	}
 
 	// If an error occurs during Update, we'll requeue the item so we can
@@ -425,41 +384,9 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	}
 
 	c.metrics.configMapLastChangeSuccessTime.Set(float64(time.Now().Unix()))
-	c.metrics.configMapLastChangeSuccessTime.Set(hashAsMetricValue(hashringConfig))
+	// todo add as hook
+	//c.metrics.configMapLastChangeSuccessTime.Set(hashAsMetricValue(hashringConfig))
 	return nil
-}
-
-// generate outputs the sorted hashrings that are currently in the cache.
-// It does not look at TTLs and takes anything that is in the cache
-// as the source of truth. It is read only and safe to call concurrently.
-func (c *Controller) generate(state map[cacheKey]ownerRefTracker) (config.Hashrings, []metav1.OwnerReference) {
-	var owners []metav1.OwnerReference
-	generated := config.Hashrings{}
-
-	for cacheKey, ownerRefs := range state {
-		hashringName, svcName := c.tracker.unwrapCacheKey(cacheKey)
-
-		for nameAndUID, _ := range ownerRefs {
-			owners = append(owners, c.buildOwnerReference(nameAndUID))
-		}
-
-		sortedTenants, sortedEndpoints := c.deduplicateAndSortByOwnerRef(svcName, ownerRefs)
-
-		generated = append(generated, config.Hashring{
-			HashringSpec: config.HashringSpec{
-				Name:    hashringName,
-				Tenants: sortedTenants,
-			},
-			Endpoints: sortedEndpoints,
-		})
-	}
-
-	sort.Sort(generated)
-	sort.Slice(owners, func(i, j int) bool {
-		return owners[i].Name < owners[j].Name
-	})
-
-	return generated, owners
 }
 
 // newConfigMap creates a new ConfigMap
@@ -479,47 +406,6 @@ func (c *Controller) newConfigMap(data string, owners []metav1.OwnerReference) *
 		},
 		BinaryData: nil,
 	}
-}
-
-func (c *Controller) buildOwnerReference(key ownerRefUID) metav1.OwnerReference {
-	name, uid := c.tracker.fromSubKey(key)
-
-	return metav1.OwnerReference{
-		APIVersion: discoveryv1.SchemeGroupVersion.String(),
-		Kind:       "EndpointSlice",
-		Name:       name,
-		UID:        uid,
-	}
-}
-
-// deduplicateAndSortByOwnerRef takes the overarching Service owner and a map of ownerRefs and
-// returns a deduplicated and sorted list of tenants and endpoints
-func (c *Controller) deduplicateAndSortByOwnerRef(svc string, ownerRefs ownerRefTracker) (tenants, endpoints []string) {
-	aggregatedTenants := make(map[string]struct{})
-	aggregatedEndpoints := make(map[string]struct{})
-
-	for _, data := range ownerRefs {
-		for _, tenant := range data.tenants {
-			aggregatedTenants[tenant] = struct{}{}
-		}
-		for endpoint, _ := range data.endpoints {
-			aggregatedEndpoints[endpoint] = struct{}{}
-		}
-	}
-
-	endpoints = make([]string, 0, len(aggregatedEndpoints))
-	for endpoint, _ := range aggregatedEndpoints {
-		endpoints = append(endpoints, endpoint)
-	}
-
-	tenants = make([]string, 0, len(aggregatedTenants))
-	for tenant, _ := range aggregatedTenants {
-		tenants = append(tenants, tenant)
-	}
-
-	sort.Strings(endpoints)
-	sort.Strings(tenants)
-	return tenants, endpoints
 }
 
 func (c *Controller) onEndpointSliceAdd(obj interface{}) {

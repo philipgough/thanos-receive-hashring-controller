@@ -3,13 +3,14 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/philipgough/hashring-controller/pkg/config"
 	"github.com/prometheus/client_golang/prometheus"
 
 	corev1 "k8s.io/api/core/v1"
@@ -50,6 +51,46 @@ type fixture struct {
 	cache   *tracker
 }
 
+type trackableImpl struct {
+}
+
+type trackableCacheValue struct {
+	endpoints []string `json:"endpoints"`
+}
+
+func (t *trackableImpl) EndpointBuilder() EndpointBuilderFN {
+	return func(eps *discoveryv1.EndpointSlice, ep discoveryv1.Endpoint) (string, error) {
+		return *ep.Hostname, nil
+	}
+}
+
+func (t *trackableImpl) SetValueFor(eps *discoveryv1.EndpointSlice, endpoints []string) (interface{}, error) {
+	return trackableCacheValue{
+		endpoints: endpoints,
+	}, nil
+}
+
+func (t *trackableImpl) Generate(values [][]interface{}) (string, error) {
+	var endpoints []string
+	for _, value := range values {
+		for _, v := range value {
+			cached, ok := v.(trackableCacheValue)
+			if !ok {
+				return "", fmt.Errorf("expected HashringConfig but got %T", v)
+			}
+			endpoints = append(endpoints, cached.endpoints...)
+		}
+	}
+	sort.Slice(endpoints, func(i, j int) bool {
+		return endpoints[i] < endpoints[j]
+	})
+	b, err := json.Marshal(endpoints)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
 func endpointsFixture() []discoveryv1.Endpoint {
 	return []discoveryv1.Endpoint{
 		{
@@ -74,15 +115,6 @@ func endpointsFixture() []discoveryv1.Endpoint {
 	}
 }
 
-func hashringsAsStringData(t *testing.T, hashrings config.Hashrings) string {
-	t.Helper()
-	b, err := json.Marshal(hashrings)
-	if err != nil {
-		t.Errorf("failed to marshal hashrings: %v", err)
-	}
-	return string(b)
-}
-
 func TestDoNothing(t *testing.T) {
 	f := newFixture(t)
 	eps := newEndpointSlice("test", endpointsFixture())
@@ -101,27 +133,15 @@ func TestCreatesConfigMap(t *testing.T) {
 		configMapName: DefaultConfigMapName,
 		namespace:     metav1.NamespaceDefault,
 		tracker: &tracker{
-			ttl:             nil,
-			mut:             sync.RWMutex{},
-			state:           nil,
-			now:             nil,
-			endpointBuilder: nil,
-			config:          Config{},
-			logger:          nil,
+			ttl:       nil,
+			mut:       sync.RWMutex{},
+			state:     nil,
+			now:       nil,
+			trackable: &trackableImpl{},
+			logger:    nil,
 		},
 	}
-	expectData := hashringsAsStringData(t, config.Hashrings{
-		{
-			HashringSpec: config.HashringSpec{
-				Name:    testServiceName,
-				Tenants: []string{},
-			},
-			Endpoints: []string{
-				"test1." + testServiceName + ":10901",
-				"test2." + testServiceName + ":10901",
-			},
-		},
-	})
+	expectData := `["test1","test2"]`
 	expectConfigMap := ctrl.newConfigMap(expectData, []metav1.OwnerReference{buildOwnerReference(eps)})
 	f.expectCreateConfigMapAction(expectConfigMap)
 	f.run(context.Background(), getKey(eps, t))
@@ -137,18 +157,7 @@ func TestUpdatesConfigMap(t *testing.T) {
 		namespace:     metav1.NamespaceDefault,
 		logger:        slog.Default(),
 	}
-	data := hashringsAsStringData(t, config.Hashrings{
-		{
-			HashringSpec: config.HashringSpec{
-				Name:    testServiceName,
-				Tenants: []string{},
-			},
-			Endpoints: []string{
-				"test1." + testServiceName + ".default.svc.cluster.local:10901",
-				"test2." + testServiceName + ".default.svc.cluster.local:10901",
-			},
-		},
-	})
+	data := `["test1","test2"]`
 	cm := ctrl.newConfigMap(data, []metav1.OwnerReference{buildOwnerReference(eps)})
 
 	updatedEPS := append(eps.Endpoints, discoveryv1.Endpoint{
@@ -159,19 +168,7 @@ func TestUpdatesConfigMap(t *testing.T) {
 	})
 	eps.Endpoints = updatedEPS
 
-	updatedData := hashringsAsStringData(t, config.Hashrings{
-		{
-			HashringSpec: config.HashringSpec{
-				Name:    testServiceName,
-				Tenants: []string{},
-			},
-			Endpoints: []string{
-				"hello." + testServiceName + ":10901",
-				"test1." + testServiceName + ":10901",
-				"test2." + testServiceName + ":10901",
-			},
-		},
-	})
+	updatedData := `["hello","test1","test2"]`
 	expectCM := ctrl.newConfigMap(updatedData, []metav1.OwnerReference{buildOwnerReference(eps)})
 
 	f.endpointSliceLister = append(f.endpointSliceLister, eps)
@@ -192,18 +189,7 @@ func TestUpdateConfigMapWithNotReady(t *testing.T) {
 		namespace:     metav1.NamespaceDefault,
 		logger:        slog.Default(),
 	}
-	data := hashringsAsStringData(t, config.Hashrings{
-		{
-			HashringSpec: config.HashringSpec{
-				Name:    testServiceName,
-				Tenants: []string{},
-			},
-			Endpoints: []string{
-				"test1." + testServiceName + ":10901",
-				"test2." + testServiceName + ":10901",
-			},
-		},
-	})
+	data := `["test1","test2"]`
 	cm := ctrl.newConfigMap(data, []metav1.OwnerReference{buildOwnerReference(eps)})
 
 	eps.Endpoints[0] = discoveryv1.Endpoint{
@@ -222,18 +208,7 @@ func TestUpdateConfigMapWithNotReady(t *testing.T) {
 
 	eps.Endpoints = updatedEPS
 
-	updatedData := hashringsAsStringData(t, config.Hashrings{
-		{
-			HashringSpec: config.HashringSpec{
-				Name:    testServiceName,
-				Tenants: []string{},
-			},
-			Endpoints: []string{
-				"hello." + testServiceName + ":10901",
-				"test2." + testServiceName + ":10901",
-			},
-		},
-	})
+	updatedData := `["hello","test2"]`
 	expectCM := ctrl.newConfigMap(updatedData, []metav1.OwnerReference{buildOwnerReference(eps)})
 
 	f.endpointSliceLister = append(f.endpointSliceLister, eps)
@@ -262,13 +237,14 @@ func (f *fixture) newController(ctx context.Context) (*Controller, informers.Sha
 		k8sI.Discovery().V1().EndpointSlices(),
 		k8sI.Core().V1().ConfigMaps(),
 		f.kubeclient,
+		nil,
 		metav1.NamespaceDefault,
 		nil,
 		slog.Default(),
 		prometheus.NewRegistry(),
 	)
 
-	c.tracker = newTracker(nil, slog.Default(), nil)
+	c.tracker = newTracker(nil, slog.Default(), &trackableImpl{})
 
 	if f.cache != nil {
 		c.tracker = f.cache
@@ -427,99 +403,6 @@ func newEndpointSlice(name string, endpoints []discoveryv1.Endpoint) *discoveryv
 			},
 		},
 		Endpoints: endpoints,
-	}
-}
-
-func TestControllerGenerate(t *testing.T) {
-	tests := []struct {
-		name     string
-		tracker  *tracker
-		expected config.Hashrings
-	}{
-		{
-			name: "Test single hashring with multiple endpoints and tenants",
-			tracker: &tracker{
-				mut: sync.RWMutex{},
-				state: map[cacheKey]ownerRefTracker{
-					defaultSVC + "/" + defaultSVC: {
-						"some-uid": &hashring{
-							tenants: []string{"tenant1", "tenant2"},
-							endpoints: map[string]*time.Time{
-								"endpoint1": nil,
-								"endpoint2": nil,
-							},
-						},
-					},
-				},
-			},
-			expected: config.Hashrings{
-				{
-					HashringSpec: config.HashringSpec{
-						Name:    defaultSVC,
-						Tenants: []string{"tenant1", "tenant2"},
-					},
-					Endpoints: []string{"endpoint1", "endpoint2"},
-				},
-			},
-		},
-		{
-			name: "Test multiple hashring with multiple endpoints and tenants",
-			tracker: &tracker{
-				mut: sync.RWMutex{},
-				state: map[cacheKey]ownerRefTracker{
-					defaultSVC + "/" + defaultSVC: {
-						"some-uid": &hashring{
-							tenants: []string{"tenant1", "tenant2"},
-							endpoints: map[string]*time.Time{
-								"endpoint1": nil,
-								"endpoint2": nil,
-							},
-						},
-					},
-					defaultHashring: {
-						"some-other-uid": &hashring{
-							tenants: []string{"an-other"},
-							endpoints: map[string]*time.Time{
-								"endpoint10": nil,
-								"endpoint20": nil,
-							},
-						},
-					},
-				},
-			},
-			expected: config.Hashrings{
-				{
-					HashringSpec: config.HashringSpec{
-						Name:    defaultHashring,
-						Tenants: []string{"an-other"},
-					},
-					Endpoints: []string{"endpoint10", "endpoint20"},
-				},
-				{
-					HashringSpec: config.HashringSpec{
-						Name:    defaultSVC,
-						Tenants: []string{"tenant1", "tenant2"},
-					},
-					Endpoints: []string{"endpoint1", "endpoint2"},
-				},
-			},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			tracker := test.tracker
-			tracker.endpointBuilder = func(ep discoveryv1.Endpoint, eps *discoveryv1.EndpointSlice) (string, error) {
-				return *ep.Hostname, nil
-			}
-			ctrl := &Controller{
-				tracker: test.tracker,
-				logger:  slog.Default(),
-			}
-			hashrings, _ := ctrl.generate(test.tracker.state)
-			if !reflect.DeepEqual(hashrings, test.expected) {
-				t.Errorf("Unexpected result: %v (expected: %v)", hashrings, test.expected)
-			}
-		})
 	}
 }
 
