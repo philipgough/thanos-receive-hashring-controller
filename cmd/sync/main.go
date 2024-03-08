@@ -30,7 +30,7 @@ const (
 
 	resyncPeriod       = time.Minute
 	defaultWaitForSync = false
-	defaultPath        = "/var/lib/thanos-receive/hashrings.json"
+	defaultPath        = "/tmp/data.txt"
 )
 
 var (
@@ -61,7 +61,7 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	logger = logger.With("component", "hashring-syncer")
+	logger = logger.With("component", "configmap-syncer")
 
 	r := prometheus.NewRegistry()
 	r.MustRegister(
@@ -99,8 +99,6 @@ func main() {
 	}
 
 	// if wait is set then we want to leverage a postStart hook to ensure contents on disk
-	// in order to ensure Thanos starts correctly. We can exit early in any case.
-	// todo this might be better handled as a subcommand
 	if wait {
 		if err := controller.WaitForFileToSync(ctx); err != nil {
 			logger.Error("failed to wait for file to sync to disk", "err", err)
@@ -159,6 +157,5 @@ func init() {
 	flag.StringVar(&pathToWrite, "path", defaultPath, "The path to write to")
 
 	// the wait flag can be used as a lifecycle hook to ensure criteria is met before starting other applications
-	// todo - this might make more sense as a time.Duration or sub-command
 	flag.BoolVar(&wait, "wait", defaultWaitForSync, "Should wait for sync. Exits when done or context times out")
 }

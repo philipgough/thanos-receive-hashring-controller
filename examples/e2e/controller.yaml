@@ -47,7 +47,6 @@ metadata:
     app.kubernetes.io/component: kubernetes-controller
     app.kubernetes.io/instance: hashring-controller
     app.kubernetes.io/name: hashring-controller
-    app.kubernetes.io/version: main
   name: hashring-controller
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -64,24 +63,26 @@ kind: Deployment
 metadata:
   name: hashring-controller
   labels:
-    app: hashring-controller
+    app.kubernetes.io/name: hashring-controller
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: hashring-controller
+      app.kubernetes.io/name: hashring-controller
   template:
     metadata:
       labels:
-        app: hashring-controller
+        app.kubernetes.io/name: hashring-controller
     spec:
       serviceAccountName: hashring-controller
       containers:
         - name: hashring-controller
           image: quay.io/philipgough/hashring-controller:latest
-          args: ["--namespace=$(NAMESPACE)"]
+          args: ["--namespace=$(NAMESPACE)", "--log-level=debug"]
           ports:
             - containerPort: 8080
+              name: http
+          imagePullPolicy: Always
           resources:
             requests:
               cpu: 100m
@@ -106,3 +107,16 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.namespace
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: thanos-receive-controller
+  labels:
+    app.kubernetes.io/name: hashring-controller
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: thanos-receive-controller
+  podMetricsEndpoints:
+    - port: http

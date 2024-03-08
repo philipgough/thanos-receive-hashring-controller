@@ -3,12 +3,16 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: sync-controller
+  labels:
+    app.kubernetes.io/name: thanos-receive
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: sync-controller
+  labels:
+    app.kubernetes.io/name: thanos-receive
 rules:
   - apiGroups:
       - ""
@@ -23,6 +27,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: sync-controller
+  labels:
+    app.kubernetes.io/name: thanos-receive
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -37,12 +43,12 @@ kind: Service
 metadata:
   name: thanos-receive-hashring
   labels:
-    app: thanos-receive
-    hashring.controller.io/watch: 'true'
-    hashring.controller.io/hashring: 'endpointslice'
+    app.kubernetes.io/name: thanos-receive
+    endpointslice.controller.io/watch: 'true'
+    endpointslice.controller.io/hashring: 'endpointslice'
 spec:
   selector:
-    app: thanos-receive
+    app.kubernetes.io/name: thanos-receive
   clusterIP: None
   ipFamilies:
     - IPv4
@@ -62,10 +68,10 @@ kind: Service
 metadata:
   name: thanos-receive
   labels:
-    app: thanos-receive
+    app.kubernetes.io/name: thanos-receive
 spec:
   selector:
-    app: thanos-receive
+    app.kubernetes.io/name: thanos-receive
   ports:
     - name: grpc
       protocol: TCP
@@ -86,18 +92,32 @@ kind: StatefulSet
 apiVersion: apps/v1
 metadata:
   name: thanos-receive
+  labels:
+    app.kubernetes.io/name: thanos-receive
 spec:
   selector:
     matchLabels:
-      app: thanos-receive
+      app.kubernetes.io/name: thanos-receive
   serviceName: thanos-receive-hashring
   replicas: 3
   minReadySeconds: 120
   template:
     metadata:
       labels:
-        app: thanos-receive
+        app.kubernetes.io/name: thanos-receive
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/name
+                      operator: In
+                      values:
+                        - thanos-receive
+                topologyKey: kubernetes.io/hostname
+              weight: 100
       serviceAccountName: sync-controller
       restartPolicy: Always
       terminationGracePeriodSeconds: 900
@@ -133,11 +153,12 @@ spec:
           lifecycle:
             postStart:
               exec:
-                command: [ "sync-controller", "--namespace=$(NAMESPACE)", "--wait=true" ]
+                command: [ "sync-controller", "--namespace=$(NAMESPACE)", "--wait=true" , "--path=/var/lib/thanos-receive/hashrings.json"]
           command:
             - sync-controller
           args:
             - '--namespace=$(NAMESPACE)'
+            - '--path=/var/lib/thanos-receive/hashrings.json'
         - readinessProbe:
             httpGet:
               path: /-/ready
@@ -187,7 +208,7 @@ spec:
             - name: hashring-config
               mountPath: /var/lib/thanos-receive
           terminationMessagePolicy: FallbackToLogsOnError
-          image: 'quay.io/thanos/thanos:v0.32.5'
+          image: 'quay.io/thanos/thanos:v0.34.1'
           args:
             - receive
             - '--log.level=info'
@@ -200,7 +221,7 @@ spec:
             - '--label=replica="$(NAME)"'
             - '--label=receive="true"'
             - >-
-              --receive.local-endpoint=$(NAME).thanos-hashring.$(NAMESPACE).svc.cluster.local:10901
+              --receive.local-endpoint=$(NAME).thanos-receive-hashring.$(NAMESPACE).svc.cluster.local:10901
             - '--receive.hashrings-file=/var/lib/thanos-receive/hashrings.json'
             - '--receive.hashrings-algorithm=ketama'
       volumes:
@@ -211,3 +232,23 @@ spec:
   podManagementPolicy: Parallel
   updateStrategy:
     type: RollingUpdate
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: observatorium-thanos-receive
+  labels:
+    app.kubernetes.io/name: thanos-receive
+spec:
+  endpoints:
+    - port: http
+      relabelings:
+        - action: replace
+          separator: /
+          sourceLabels:
+            - namespace
+            - pod
+          targetLabel: instance
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: thanos-receive

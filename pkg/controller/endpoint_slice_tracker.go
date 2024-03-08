@@ -208,6 +208,7 @@ func (t *tracker) parseEndpointsFromSlice(eps *discoveryv1.EndpointSlice) (endpo
 	}
 
 	for _, endpoint := range eps.Endpoints {
+		t.logger.Debug("parsing endpoint", "endpoint", endpoint.String())
 		createEndpointString := t.trackable.EndpointBuilder()
 		ep, err := createEndpointString(eps, endpoint)
 		if err != nil {
@@ -219,11 +220,13 @@ func (t *tracker) parseEndpointsFromSlice(eps *discoveryv1.EndpointSlice) (endpo
 			// this is a voluntary disruption, so we should remove it from the hashring
 			// it might be an indication of a scale down event or rolling update etc
 			result.terminatingEndpoints = append(result.terminatingEndpoints, ep)
+			t.logger.Debug("found terminating endpoint", "endpoint", ep)
 			continue
 		}
 
 		// we only care about ready endpoints in terms of adding nodes to the hashring
 		if endpoint.Conditions.Ready != nil && *endpoint.Conditions.Ready == true {
+			t.logger.Debug("found active endpoint", "endpoint", ep)
 			result.activeEndpoints[ep] = ttl
 		}
 	}

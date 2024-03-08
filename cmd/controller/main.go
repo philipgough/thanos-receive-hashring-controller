@@ -11,29 +11,27 @@ import (
 	"os"
 	"time"
 
-	"github.com/oklog/run"
 	"github.com/philipgough/hashring-controller/pkg/controller"
 	"github.com/philipgough/hashring-controller/pkg/signals"
+	"github.com/philipgough/hashring-controller/pkg/thanos"
+
+	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"gopkg.in/yaml.v3"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 const (
-	defaultListen   = ":8080"
-	defaultLogLevel = "info"
-
-	resyncPeriod = time.Minute
-
-	defaultInitNodeCount = 6
+	defaultListen     = ":8080"
+	defaultLogLevel   = "info"
+	defaultTTLSeconds = 600
+	// defaultInitialHashring is the default initial hashring to use if the ConfigMap does not exist.
+	// This allows Thanos to pass initial validation and start the process.
+	defaultInitialHashring = `[{"endpoints":["127.0.0.1:1234","127.0.0.1:1234","127.0.0.1:12345"]}]`
 )
 
 var (
@@ -43,20 +41,11 @@ var (
 
 	listen     string
 	logLevel   string
-	configFile string
-)
+	ttlSeconds int
 
-type config struct {
-	// SyncState consumes a pre-existing ConfigMap if it exists on startup.
-	// Defaults to true.
-	SyncState *bool `yaml:"sync_state"`
-	// WriteInitialState writes a dummy ConfigMap to the filesystem on startup.
-	// Defaults to true. This field is ignored if SyncState is true.
-	WriteInitialState *bool `yaml:"write_initial_state"`
-	// WriteInitialNodeCount is the number of nodes to write to the dummy ConfigMap.
-	// It defaults to 6 to support a replication factor of 5 out of the box
-	WriteInitialNodeCount int `yaml:"write_initial_node_count"`
-}
+	hashring string
+	static   bool
+)
 
 func main() {
 	flag.Parse()
@@ -77,19 +66,6 @@ func main() {
 		stdlog.Fatalf("error listening on %s: %s", defaultListen, err.Error())
 	}
 
-	ctrlCfg := defaultConfig()
-	if configFile != "" {
-		data, err := os.ReadFile(configFile)
-		if err != nil {
-			stdlog.Fatalf("error reading config file: %s", err.Error())
-		}
-		var cfg config
-		if err := yaml.Unmarshal(data, &cfg); err != nil {
-			stdlog.Fatalf("error parsing config file: %s", err.Error())
-		}
-		ctrlCfg = buildConfigFromFile(cfg)
-	}
-
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: getLogLevel(logLevel),
 	}))
@@ -104,38 +80,45 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{}))
 
-	endpointSliceInformer := kubeinformers.NewSharedInformerFactoryWithOptions(
-		kubeClient,
-		resyncPeriod,
-		kubeinformers.WithNamespace(namespace),
-		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{controller.ServiceLabel: "true"}.String()
-		}),
-	)
-
-	configMapInformer := kubeinformers.NewSharedInformerFactoryWithOptions(
-		kubeClient,
-		resyncPeriod,
-		kubeinformers.WithNamespace(namespace),
-		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{controller.ConfigMapLabel: "true"}.String()
-		}),
-	)
+	config := controller.DefaultConfig()
+	endpointSliceInformer, configMapInformer := controller.InformersFromConfig(kubeClient, namespace, config)
 
 	controller := controller.NewController(
-		ctx,
 		endpointSliceInformer.Discovery().V1().EndpointSlices(),
 		configMapInformer.Core().V1().ConfigMaps(),
 		kubeClient,
+		thanos.NewReceiveHashringController(nil, nil),
 		namespace,
-		nil,
+		controller.DefaultConfig(),
 		logger,
 		r,
 	)
 
-	if toBool(ctrlCfg.WriteInitialState) {
-		if err := controller.EnsureConfigMapExists(ctx, "receiver", 6); err != nil {
-			stdlog.Fatalf("error ensuring configmap exists: %s", err.Error())
+	// Check for existence of ConfigMap or create it if it doesn't exist.
+	cm, alreadyExists, err := controller.EnsureConfigMapExists(ctx, hashring)
+	if err != nil {
+		stdlog.Fatalf("error ensuring configmap exists: %s", err.Error())
+	}
+
+	if !alreadyExists {
+		// assume we are in bootstrap mode, and the ConfigMap did not exist.
+		// Give some time for Thanos Receive to start up and validate the ConfigMap.
+		logger.Info("ConfigMap did not exist, waiting for Thanos Receive to start up")
+		<-time.After(time.Minute)
+	}
+
+	if static {
+		logger.Warn("static mode enabled, no reconciliation will occur")
+		cm.Data[config.ConfigMapKey] = hashring
+		if _, err := kubeClient.CoreV1().ConfigMaps(namespace).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+			stdlog.Fatalf("error updating configmap: %s", err.Error())
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				logger.Info("controller exited gracefully from static mode")
+				os.Exit(0)
+			}
 		}
 	}
 
@@ -172,38 +155,32 @@ func main() {
 		stdlog.Fatalf("error running controller: %s", err.Error())
 	}
 	logger.Info("controller stopped gracefully")
+	os.Exit(0)
 }
 
 func init() {
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
-	flag.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
-	flag.StringVar(&namespace, "namespace", metav1.NamespaceDefault, "The namespace to watch")
-	flag.StringVar(&listen, "listen", defaultListen, "The address to listen on")
-	flag.StringVar(&logLevel, "log-level", defaultLogLevel, "The log level to use")
-	flag.StringVar(&configFile, "config", "", "Path to a config file")
-
-}
-
-func defaultConfig() config {
-	return config{
-		SyncState:             boolPtr(true),
-		WriteInitialState:     boolPtr(true),
-		WriteInitialNodeCount: defaultInitNodeCount,
-	}
-}
-
-func buildConfigFromFile(cfg config) config {
-	conf := defaultConfig()
-	if cfg.SyncState != nil {
-		conf.SyncState = cfg.SyncState
-	}
-	if cfg.WriteInitialState != nil {
-		conf.WriteInitialState = cfg.WriteInitialState
-	}
-	if cfg.WriteInitialNodeCount != 0 {
-		conf.WriteInitialNodeCount = cfg.WriteInitialNodeCount
-	}
-	return conf
+	flag.StringVar(&kubeconfig, "kubeconfig", "",
+		"Path to a kubeconfig. Only required if out-of-cluster.")
+	flag.StringVar(&masterURL, "master", "",
+		"The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
+	flag.StringVar(&namespace, "namespace", metav1.NamespaceDefault,
+		"The namespace to watch")
+	flag.StringVar(&listen, "listen", defaultListen,
+		"The address to listen on.")
+	flag.StringVar(&logLevel, "log-level", defaultLogLevel,
+		"The log level to use.")
+	flag.IntVar(&ttlSeconds, "ttl", defaultTTLSeconds,
+		"The number of seconds to cache endpoints which have become unready due to involuntary disruption.")
+	flag.StringVar(
+		&hashring,
+		"hashring",
+		defaultInitialHashring,
+		"Specifies the initial hashring to use if the ConfigMap does not exist.")
+	flag.BoolVar(
+		&static,
+		"static",
+		false,
+		"When enabled, the ConfigMap will be populated with the value of 'hashring' flag. No reconciliation occurs.")
 }
 
 func getLogLevel(lvl string) slog.Level {
@@ -220,15 +197,4 @@ func getLogLevel(lvl string) slog.Level {
 		stdlog.Printf("unknown log level %q, defaulting to info", lvl)
 		return slog.LevelInfo
 	}
-}
-
-func boolPtr(b bool) *bool {
-	return &b
-}
-
-func toBool(b *bool) bool {
-	if b == nil {
-		return false
-	}
-	return *b
 }

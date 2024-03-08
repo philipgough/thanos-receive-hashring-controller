@@ -48,7 +48,7 @@ const (
 	// should be watched by the Controller. The value of the label must be "true".
 	DefaultServiceLabel = "endpointslice.controller.io/watch"
 	// DefaultConfigMapName is the default name for the generated ConfigMap.
-	DefaultConfigMapName = "hashring-controller-generated-config"
+	DefaultConfigMapName = "endpointslice-controller-generated-config"
 	// DefaultConfigMapLabel is the default label that is used to identify ConfigMaps that are managed by the controller.
 	DefaultConfigMapLabel = "endpointslice.controller.io/managed"
 	// DefaultConfigMapKey is the default key for data insertion on the generated ConfigMap.
@@ -134,7 +134,6 @@ type Controller struct {
 }
 
 func NewController(
-	ctx context.Context,
 	endpointSliceInformer discoveryinformers.EndpointSliceInformer,
 	configMapInformer coreinformers.ConfigMapInformer,
 	client clientset.Interface,
@@ -202,29 +201,32 @@ func NewController(
 	return c
 }
 
-// EnsureConfigMapExists ensures that the controller's configmap exists or tries to create it with
-// the provided replica count.
-func (c *Controller) EnsureConfigMapExists(ctx context.Context) error {
+// EnsureConfigMapExists ensures that the controller's configmap exists or tries to create it if not.
+// If the configmap already exists, it will be returned. If it does not exist, it will be created.
+// The returned boolean indicates whether the configmap was created or not.
+func (c *Controller) EnsureConfigMapExists(ctx context.Context, data string) (*corev1.ConfigMap, bool, error) {
+	var cm *corev1.ConfigMap
 	var pollError error
+	preExists := true
 	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, time.Minute, false, func(ctx context.Context) (bool, error) {
-		_, err := c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, c.config.ConfigMapName, metav1.GetOptions{})
-		if err != nil {
+		var fetchError error
+		cm, fetchError = c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, c.config.ConfigMapName, metav1.GetOptions{})
+		if fetchError != nil {
 
-			if errors.IsNotFound(err) {
-				data := `[{"hashring":"default","endpoints":[%s],"tenants":[]}]`
-				_, pollError = c.client.CoreV1().ConfigMaps(c.namespace).
+			if errors.IsNotFound(fetchError) {
+				preExists = false
+				cm, pollError = c.client.CoreV1().ConfigMaps(c.namespace).
 					Create(ctx, c.newConfigMap(data, nil), metav1.CreateOptions{})
 				return false, nil
 			}
 		}
-
 		return true, nil
 	})
 	if err != nil {
-		return fmt.Errorf("failed to ensure configmap exists: %w: %w", err, pollError)
+		return cm, preExists, fmt.Errorf("failed to ensure configmap exists: %w: %w", err, pollError)
 	}
 
-	return nil
+	return cm, preExists, nil
 }
 
 // InformersFromConfig is a helper that returns the informers for the controller based on the given configuration.

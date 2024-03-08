@@ -15,9 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
-	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -323,39 +321,19 @@ func runController(t *testing.T, ctx context.Context, cfg *rest.Config, namespac
 		t.Fatal(err, "Error building kubernetes clientset")
 	}
 
-	endpointSliceInformer := kubeinformers.NewSharedInformerFactoryWithOptions(
-		kubeClient,
-		time.Second*30,
-		kubeinformers.WithNamespace(namespace),
-		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{controller.DefaultServiceLabel: "true"}.String()
-		}),
-	)
-
-	configMapInformer := kubeinformers.NewSharedInformerFactoryWithOptions(
-		kubeClient,
-		time.Second*30,
-		kubeinformers.WithNamespace(namespace),
-		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{controller.DefaultConfigMapLabel: "true"}.String()
-		}),
-	)
-
-	var opts *controller.Options
+	config := controller.DefaultConfig()
 	if cacheTTL != nil {
-		opts = &controller.Options{
-			TTL: cacheTTL,
-		}
+		config.TTL = cacheTTL
 	}
+	endpointSliceInformer, configMapInformer := controller.InformersFromConfig(kubeClient, namespace, config)
 
 	controller := controller.NewController(
-		ctx,
 		endpointSliceInformer.Discovery().V1().EndpointSlices(),
 		configMapInformer.Core().V1().ConfigMaps(),
 		kubeClient,
 		NewReceiveHashringController(nil, nil),
 		namespace,
-		opts,
+		config,
 		slog.Default(),
 		prometheus.NewRegistry(),
 	)

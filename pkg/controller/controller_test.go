@@ -130,8 +130,8 @@ func TestCreatesConfigMap(t *testing.T) {
 	f.objects = append(f.objects, eps)
 
 	ctrl := &Controller{
-		configMapName: DefaultConfigMapName,
-		namespace:     metav1.NamespaceDefault,
+		config:    DefaultConfig(),
+		namespace: metav1.NamespaceDefault,
 		tracker: &tracker{
 			ttl:       nil,
 			mut:       sync.RWMutex{},
@@ -153,9 +153,9 @@ func TestUpdatesConfigMap(t *testing.T) {
 	_, ctx := ktesting.NewTestContext(t)
 
 	ctrl := &Controller{
-		configMapName: DefaultConfigMapName,
-		namespace:     metav1.NamespaceDefault,
-		logger:        slog.Default(),
+		config:    DefaultConfig(),
+		namespace: metav1.NamespaceDefault,
+		logger:    slog.Default(),
 	}
 	data := `["test1","test2"]`
 	cm := ctrl.newConfigMap(data, []metav1.OwnerReference{buildOwnerReference(eps)})
@@ -185,9 +185,9 @@ func TestUpdateConfigMapWithNotReady(t *testing.T) {
 	eps := newEndpointSlice("test", endpointsFixture())
 
 	ctrl := &Controller{
-		configMapName: DefaultConfigMapName,
-		namespace:     metav1.NamespaceDefault,
-		logger:        slog.Default(),
+		config:    DefaultConfig(),
+		namespace: metav1.NamespaceDefault,
+		logger:    slog.Default(),
 	}
 	data := `["test1","test2"]`
 	cm := ctrl.newConfigMap(data, []metav1.OwnerReference{buildOwnerReference(eps)})
@@ -227,19 +227,18 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
-func (f *fixture) newController(ctx context.Context) (*Controller, informers.SharedInformerFactory) {
+func (f *fixture) newController() (*Controller, informers.SharedInformerFactory) {
 	f.kubeclient = fake.NewSimpleClientset(f.objects...)
 
 	k8sI := informers.NewSharedInformerFactory(f.kubeclient, noResyncPeriodFunc())
 
 	c := NewController(
-		ctx,
 		k8sI.Discovery().V1().EndpointSlices(),
 		k8sI.Core().V1().ConfigMaps(),
 		f.kubeclient,
 		nil,
 		metav1.NamespaceDefault,
-		nil,
+		DefaultConfig(),
 		slog.Default(),
 		prometheus.NewRegistry(),
 	)
@@ -273,7 +272,7 @@ func (f *fixture) runExpectError(ctx context.Context, key string) {
 }
 
 func (f *fixture) runController(ctx context.Context, key string, startInformers bool, expectError bool) {
-	c, k8sI := f.newController(ctx)
+	c, k8sI := f.newController()
 	if startInformers {
 		k8sI.Start(ctx.Done())
 	}
