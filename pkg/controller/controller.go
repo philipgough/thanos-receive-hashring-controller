@@ -14,16 +14,18 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	kubeinformers "k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	discoveryinformers "k8s.io/client-go/informers/discovery/v1"
+	"k8s.io/client-go/kubernetes"
 	clientset "k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/utils/pointer"
 )
 
 // EndpointBuilderFN is a function that builds an endpoint string from an Endpoint and an EndpointSlice
@@ -51,12 +53,45 @@ const (
 	DefaultConfigMapLabel = "endpointslice.controller.io/managed"
 	// DefaultConfigMapKey is the default key for data insertion on the generated ConfigMap.
 	DefaultConfigMapKey = "data.json"
+	// DefaultReSyncPeriod is the default period at which the controller will resync.
+	DefaultReSyncPeriod = time.Minute
 
 	// defaultSyncBackOff is the default backoff period for syncService calls.
 	defaultSyncBackOff = 1 * time.Second
 	// maxSyncBackOff is the max backoff period for sync calls.
 	maxSyncBackOff = 1000 * time.Second
 )
+
+// Config is the configuration for the Controller.
+type Config struct {
+	// ReSyncPeriod is the period at which the controller will resync.
+	ReSyncPeriod time.Duration
+	// ServiceLabel is the label that marks that headless Service should be watched by the Controller.
+	// The value of the label must be "true".
+	ServiceLabel string
+	// ConfigMapName is the name for the generated ConfigMap.
+	ConfigMapName string
+	// ConfigMapKey is the key for data insertion on the generated ConfigMap.
+	ConfigMapKey string
+	// ConfigMapLabel is the label that is used to identify ConfigMaps that are managed by the controller.
+	ConfigMapLabel string
+	// TTL controls the duration for which expired entries are kept in the cache.
+	// By default, an endpoint is considered expired if it has become unready due to an involuntary disruption.
+	// A nil value disables TTL.
+	TTL *time.Duration
+}
+
+// DefaultConfig returns the default configuration for the Controller.
+func DefaultConfig() Config {
+	return Config{
+		ReSyncPeriod:   DefaultReSyncPeriod,
+		ServiceLabel:   DefaultServiceLabel,
+		ConfigMapName:  DefaultConfigMapName,
+		ConfigMapKey:   DefaultConfigMapKey,
+		ConfigMapLabel: DefaultConfigMapLabel,
+		TTL:            nil,
+	}
+}
 
 // Controller manages selector-based service endpoint slices
 type Controller struct {
@@ -92,36 +127,10 @@ type Controller struct {
 	tracker *tracker
 	// trackable is the implementation of the Trackable interface that will be cached and generated
 	trackable Trackable
-
-	// configMapName is the name of the configmap that the controller will generate
-	configMapName string
-	// configMapKey is the key of the configmap that the controller will generate
-	configMapKey string
-	// namespace is the namespace that the controller will operate in
 	namespace string
+	config    Config
 	logger    *slog.Logger
 	metrics   *metrics
-}
-
-// Options provides a source to override default controller behaviour
-type Options struct {
-	// TTL controls the duration for which expired entries are kept in the cache
-	// If not set, no TTL will be applied
-	// Only Endpoints that have become unready due to an involuntary disruption are cached
-	// Terminated Endpoints are removed from the hashring in all cases
-	TTL *time.Duration
-	// ConfigMapKey is the key for hashring config on the generated ConfigMap
-	ConfigMapKey *string
-	// ConfigMapName is the name of the generated ConfigMap
-	ConfigMapName *string
-}
-
-func DefaultOptions() *Options {
-	return &Options{
-		TTL:           nil,
-		ConfigMapName: pointer.String(DefaultConfigMapName),
-		ConfigMapKey:  pointer.String(DefaultConfigMapKey),
-	}
 }
 
 func NewController(
@@ -131,11 +140,10 @@ func NewController(
 	client clientset.Interface,
 	trackable Trackable,
 	namespace string,
-	opts *Options,
+	config Config,
 	logger *slog.Logger,
 	registry *prometheus.Registry,
 ) *Controller {
-	opts = buildOpts(opts)
 
 	ctrlMetrics := newMetrics()
 	if registry == nil {
@@ -143,9 +151,7 @@ func NewController(
 	}
 
 	c := &Controller{
-		client:        client,
-		configMapName: *opts.ConfigMapName,
-		configMapKey:  *opts.ConfigMapKey,
+		client: client,
 		// This is similar to the DefaultControllerRateLimiter, just with a
 		// significantly higher default backoff (1s vs 5ms). A more significant
 		// rate limit back off here helps ensure that the Controller does not
@@ -160,7 +166,8 @@ func NewController(
 			workqueue.RateLimitingQueueConfig{Name: "endpoint_slice"}),
 		workerLoopPeriod: time.Second,
 		namespace:        namespace,
-		tracker:          newTracker(opts.TTL, logger.With("component", "endpointslice_tracker"), trackable),
+		config:           config,
+		tracker:          newTracker(config.TTL, logger.With("component", "endpointslice_tracker"), trackable),
 		logger:           logger,
 		metrics:          ctrlMetrics,
 	}
@@ -200,7 +207,7 @@ func NewController(
 func (c *Controller) EnsureConfigMapExists(ctx context.Context) error {
 	var pollError error
 	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, time.Minute, false, func(ctx context.Context) (bool, error) {
-		_, err := c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, c.configMapName, metav1.GetOptions{})
+		_, err := c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, c.config.ConfigMapName, metav1.GetOptions{})
 		if err != nil {
 
 			if errors.IsNotFound(err) {
@@ -218,6 +225,33 @@ func (c *Controller) EnsureConfigMapExists(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// InformersFromConfig is a helper that returns the informers for the controller based on the given configuration.
+func InformersFromConfig(
+	client kubernetes.Interface,
+	namespace string,
+	config Config,
+) (kubeinformers.SharedInformerFactory, kubeinformers.SharedInformerFactory) {
+
+	endpointSliceInformer := kubeinformers.NewSharedInformerFactoryWithOptions(
+		client,
+		config.ReSyncPeriod,
+		kubeinformers.WithNamespace(namespace),
+		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = labels.Set{config.ServiceLabel: "true"}.String()
+		}),
+	)
+
+	configMapInformer := kubeinformers.NewSharedInformerFactoryWithOptions(
+		client,
+		config.ReSyncPeriod,
+		kubeinformers.WithNamespace(namespace),
+		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = labels.Set{config.ConfigMapLabel: "true"}.String()
+		}),
+	)
+	return endpointSliceInformer, configMapInformer
 }
 
 // Run will set up the event handlers for types we are interested in, as well
@@ -358,7 +392,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	}
 
 	// Get the ConfigMap or create it if it doesn't exist.
-	cm, err := c.configMapLister.ConfigMaps(c.namespace).Get(c.configMapName)
+	cm, err := c.configMapLister.ConfigMaps(c.namespace).Get(c.config.ConfigMapName)
 	if errors.IsNotFound(err) {
 		cm, err = c.client.CoreV1().ConfigMaps(c.namespace).Create(ctx,
 			c.newConfigMap(output, owners), metav1.CreateOptions{})
@@ -371,7 +405,7 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		return err
 	}
 
-	if cm.Data[c.configMapKey] != output {
+	if cm.Data[c.config.ConfigMapKey] != output {
 		_, err = c.client.CoreV1().ConfigMaps(c.namespace).Update(
 			ctx, c.newConfigMap(output, owners), metav1.UpdateOptions{})
 	}
@@ -394,15 +428,15 @@ func (c *Controller) reconcile(ctx context.Context) error {
 func (c *Controller) newConfigMap(data string, owners []metav1.OwnerReference) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      c.configMapName,
+			Name:      c.config.ConfigMapName,
 			Namespace: c.namespace,
 			Labels: map[string]string{
-				DefaultConfigMapLabel: "true",
+				c.config.ConfigMapLabel: "true",
 			},
 			OwnerReferences: owners,
 		},
 		Data: map[string]string{
-			DefaultConfigMapKey: data,
+			c.config.ConfigMapKey: data,
 		},
 		BinaryData: nil,
 	}
@@ -502,23 +536,4 @@ func (c *Controller) shouldEnqueue(eps *discoveryv1.EndpointSlice) bool {
 		return false
 	}
 	return true
-}
-
-func buildOpts(o *Options) *Options {
-	if o == nil {
-		o = &Options{
-			TTL:           nil,
-			ConfigMapName: pointer.String(DefaultConfigMapName),
-			ConfigMapKey:  pointer.String(DefaultConfigMapKey),
-		}
-		return o
-	}
-
-	if o.ConfigMapName == nil {
-		o.ConfigMapName = pointer.String(DefaultConfigMapName)
-	}
-	if o.ConfigMapKey == nil {
-		o.ConfigMapKey = pointer.String(DefaultConfigMapKey)
-	}
-	return o
 }
