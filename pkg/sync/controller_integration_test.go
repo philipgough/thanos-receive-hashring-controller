@@ -5,11 +5,11 @@ package sync
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/philipgough/hashring-controller/pkg/controller"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -95,7 +95,7 @@ func runController(t *testing.T, ctx context.Context, cfg *rest.Config, namespac
 		time.Second*30,
 		kubeinformers.WithNamespace(namespace),
 		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{controller.ConfigMapLabel: "true"}.String()
+			options.LabelSelector = labels.Set{controller.DefaultConfigMapLabel: "true"}.String()
 		}),
 	)
 
@@ -104,7 +104,7 @@ func runController(t *testing.T, ctx context.Context, cfg *rest.Config, namespac
 		configMapInformer.Core().V1().ConfigMaps(),
 		kubeClient,
 		namespace,
-		log.NewNopLogger(),
+		slog.Default(),
 		prometheus.NewRegistry(),
 		Options{
 			ConfigMapKey:  controller.DefaultConfigMapKey,
@@ -132,7 +132,7 @@ func buildConfigMap(t *testing.T, namespace, name, hashringName, endpoints, tena
 			Name:      name,
 			Namespace: namespace,
 			Labels: map[string]string{
-				controller.ConfigMapLabel: "true",
+				controller.DefaultConfigMapLabel: "true",
 			},
 		},
 		Data: map[string]string{

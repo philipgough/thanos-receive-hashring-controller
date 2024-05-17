@@ -1,13 +1,13 @@
 package controller
 
 import (
-	"fmt"
-	"github.com/go-kit/log"
+	"log/slog"
+	"testing"
+	"time"
+
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
-	"testing"
-	"time"
 )
 
 func TestSaveOrMerge(t *testing.T) {
@@ -62,8 +62,8 @@ func TestSaveOrMerge(t *testing.T) {
 			wantState: func() map[cacheKey]ownerRefTracker {
 				state := emptyState(t)
 				nested := make(ownerRefTracker)
-				nested["test/blaa"] = &hashring{
-					tenants: []string{defaultTenant},
+				nested["test/blaa"] = &cacheValue{
+
 					endpoints: map[string]*time.Time{
 						"host-test":  nil,
 						"host-test1": nil,
@@ -80,8 +80,8 @@ func TestSaveOrMerge(t *testing.T) {
 				state: func() map[cacheKey]ownerRefTracker {
 					state := emptyState(t)
 					nested := make(ownerRefTracker)
-					nested["test/blaa"] = &hashring{
-						tenants: []string{defaultTenant},
+					nested["test/blaa"] = &cacheValue{
+
 						endpoints: map[string]*time.Time{
 							"host-test":  nil,
 							"host-test1": nil,
@@ -115,8 +115,8 @@ func TestSaveOrMerge(t *testing.T) {
 			wantState: func() map[cacheKey]ownerRefTracker {
 				state := emptyState(t)
 				nested := make(ownerRefTracker)
-				nested["test/blaa"] = &hashring{
-					tenants: []string{defaultTenant},
+				nested["test/blaa"] = &cacheValue{
+
 					endpoints: map[string]*time.Time{
 						"host-test1": nil,
 					},
@@ -160,8 +160,8 @@ func TestSaveOrMerge(t *testing.T) {
 			wantState: func() map[cacheKey]ownerRefTracker {
 				state := emptyState(t)
 				nested := make(ownerRefTracker)
-				nested["test/blaa"] = &hashring{
-					tenants: []string{defaultTenant},
+				nested["test/blaa"] = &cacheValue{
+
 					endpoints: map[string]*time.Time{
 						"host-test":  &expectOneHour,
 						"host-test1": &expectOneHour,
@@ -181,8 +181,8 @@ func TestSaveOrMerge(t *testing.T) {
 				state: func() map[cacheKey]ownerRefTracker {
 					state := emptyState(t)
 					nested := make(ownerRefTracker)
-					nested["test/blaa"] = &hashring{
-						tenants: []string{defaultTenant},
+					nested["test/blaa"] = &cacheValue{
+
 						endpoints: map[string]*time.Time{
 							"host-test":  &expectOneHour,
 							"host-test1": &expectOneHour,
@@ -216,8 +216,8 @@ func TestSaveOrMerge(t *testing.T) {
 			wantState: func() map[cacheKey]ownerRefTracker {
 				state := emptyState(t)
 				nested := make(ownerRefTracker)
-				nested["test/blaa"] = &hashring{
-					tenants: []string{defaultTenant},
+				nested["test/blaa"] = &cacheValue{
+
 					endpoints: map[string]*time.Time{
 						"host-test":  &expectOneHour,
 						"host-test1": &expectOneHour,
@@ -237,8 +237,8 @@ func TestSaveOrMerge(t *testing.T) {
 				state: func() map[cacheKey]ownerRefTracker {
 					state := emptyState(t)
 					nested := make(ownerRefTracker)
-					nested["test/blaa"] = &hashring{
-						tenants: []string{defaultTenant},
+					nested["test/blaa"] = &cacheValue{
+
 						endpoints: map[string]*time.Time{
 							"host-test":  &now,
 							"host-test1": &now,
@@ -272,8 +272,8 @@ func TestSaveOrMerge(t *testing.T) {
 			wantState: func() map[cacheKey]ownerRefTracker {
 				state := emptyState(t)
 				nested := make(ownerRefTracker)
-				nested["test/blaa"] = &hashring{
-					tenants: []string{defaultTenant},
+				nested["test/blaa"] = &cacheValue{
+
 					endpoints: map[string]*time.Time{
 						"host-test1": &expectUpdatedCacheTTL,
 					},
@@ -282,58 +282,11 @@ func TestSaveOrMerge(t *testing.T) {
 				return state
 			}(),
 		},
-		{
-			name: "Test single entry on empty state with label overrides. No cache",
-			tracker: &tracker{
-				ttl: nil,
-				state: func() map[cacheKey]ownerRefTracker {
-					return emptyState(t)
-				}(),
-			},
-			args: args{
-				eps: &discoveryv1.EndpointSlice{
-					ObjectMeta: func() metav1.ObjectMeta {
-						m := boilerPlateObjMeta(t)
-						m.Labels[TenantIdentifierLabel] = fmt.Sprintf("%s,tenant-2", defaultTenant)
-						m.Labels[HashringNameIdentifierLabel] = ""
-						return *m
-					}(),
-					Endpoints: []discoveryv1.Endpoint{
-						{
-							Hostname: pointer.String("host-test"),
-							Conditions: discoveryv1.EndpointConditions{
-								Ready: pointer.Bool(true),
-							},
-						},
-						{
-							Hostname: pointer.String("host-test1"),
-							Conditions: discoveryv1.EndpointConditions{
-								Ready: pointer.Bool(true),
-							},
-						},
-					},
-				},
-			},
-			wantKey:      defaultSVC + "/" + defaultSVC,
-			wantOwnerRef: boilerPlateOwnerRef(t),
-			wantState: func() map[cacheKey]ownerRefTracker {
-				state := emptyState(t)
-				nested := make(ownerRefTracker)
-				nested["test/blaa"] = &hashring{
-					tenants: []string{defaultTenant, "tenant2"},
-					endpoints: map[string]*time.Time{
-						"host-test":  nil,
-						"host-test1": nil,
-					},
-				}
-				state[defaultSVC+"/"+defaultSVC] = nested
-				return state
-			}(),
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.tracker.logger = log.NewNopLogger()
+			tt.tracker.logger = slog.Default()
+			tt.tracker.trackable = &trackableImpl{}
 			err := tt.tracker.saveOrMerge(tt.args.eps)
 			if err != nil {
 				t.Errorf("tracker.saveOrMerge() error = %v", err)
@@ -357,14 +310,14 @@ func assertEqual(t *testing.T, want map[cacheKey]ownerRefTracker, got map[cacheK
 			t.Errorf("want length of inner map = %v, got %v", len(want[outerKey]), len(innerKey))
 		}
 
-		for uuid, hashring := range innerKey {
+		for uuid, value := range innerKey {
 			if _, ok := want[outerKey][uuid]; !ok {
 				t.Errorf("want uuid %v not found in want", uuid)
 			}
-			if len(hashring.endpoints) != len(want[outerKey][uuid].endpoints) {
-				t.Errorf("want length of endpoints = %v, got %v", len(want[outerKey][uuid].endpoints), len(hashring.endpoints))
+			if len(value.endpoints) != len(want[outerKey][uuid].endpoints) {
+				t.Errorf("want length of endpoints = %v, got %v", len(want[outerKey][uuid].endpoints), len(value.endpoints))
 			}
-			for endpoint, timestamp := range hashring.endpoints {
+			for endpoint, timestamp := range value.endpoints {
 				if _, ok := want[outerKey][uuid].endpoints[endpoint]; !ok {
 					t.Errorf("want endpoint %v not found in want", endpoint)
 				}
@@ -385,10 +338,7 @@ func emptyState(t *testing.T) map[cacheKey]ownerRefTracker {
 
 const (
 	defaultSVC      = "service1"
-	defaultHashring = "default"
-	defaultTenant   = "tenant1"
-
-	defaultCacheKey = defaultHashring + "/" + defaultSVC
+	defaultCacheKey = defaultSVC
 )
 
 func boilerPlateObjMeta(t *testing.T) *metav1.ObjectMeta {
@@ -398,8 +348,6 @@ func boilerPlateObjMeta(t *testing.T) *metav1.ObjectMeta {
 		Namespace: "test",
 		Labels: map[string]string{
 			discoveryv1.LabelServiceName: defaultSVC,
-			TenantIdentifierLabel:        defaultTenant,
-			HashringNameIdentifierLabel:  defaultHashring,
 		},
 		UID: "blaa",
 	}

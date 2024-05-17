@@ -3,11 +3,10 @@ package sync
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"golang.org/x/time/rate"
@@ -52,7 +51,7 @@ type Controller struct {
 	// namespace is the namespace of the configmap that the controller will generate
 	namespace string
 
-	logger  log.Logger
+	logger  *slog.Logger
 	metrics *metrics
 
 	path string
@@ -73,14 +72,10 @@ func NewController(
 	configMapInformer coreinformers.ConfigMapInformer,
 	client clientset.Interface,
 	namespace string,
-	logger log.Logger,
+	logger *slog.Logger,
 	registry *prometheus.Registry,
 	opts Options,
 ) (*Controller, error) {
-
-	if logger == nil {
-		logger = log.NewNopLogger()
-	}
 
 	ctrlMetrics := newMetrics()
 	if registry == nil {
@@ -135,21 +130,21 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 	defer c.queue.ShutDown()
 
 	// Start the informer factories to begin populating the informer caches
-	level.Info(c.logger).Log("msg", "starting hashring sync controller")
-	level.Info(c.logger).Log("msg", "waiting for informer caches to sync")
+	c.logger.Info("starting hashring sync controller")
+	c.logger.Info("waiting for informer caches to sync")
 
 	if ok := cache.WaitForCacheSync(ctx.Done(), c.configMapSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	level.Info(c.logger).Log("msg", "starting workers", "count", workers)
+	c.logger.Info("starting workers", slog.Int("count", workers))
 	for i := 0; i < workers; i++ {
 		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
 
-	level.Info(c.logger).Log("msg", "started workers")
+	c.logger.Info("started workers")
 	<-ctx.Done()
-	level.Info(c.logger).Log("msg", "shutting down workers")
+	c.logger.Info("shutting down workers")
 
 	return nil
 }
@@ -212,7 +207,7 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 		// Finally, if no error occurs we Forget this item so it does not
 		// get queued again until another change happens.
 		c.queue.Forget(obj)
-		level.Debug(c.logger).Log("msg", "successfully synced", "resourceName", key)
+		c.logger.Debug("successfully synced", "resourceName", key)
 		return nil
 	}(obj)
 
@@ -226,7 +221,7 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 
 // syncHandler compares the actual state with the desired, and attempts to converge the two.
 func (c *Controller) syncHandler(ctx context.Context, key string) error {
-	level.Debug(c.logger).Log("msg", "syncHandler called", "resourceName", key)
+	c.logger.Debug("syncHandler called", "resourceName", key)
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
@@ -246,12 +241,12 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 
 	data, ok := cm.Data[c.key]
 	if !ok {
-		level.Warn(c.logger).Log("msg", "no data found for key", "key", c.key)
+		c.logger.Warn("no data found for key", "key", c.key)
 		return nil
 	}
 
 	if err := os.WriteFile(c.path, []byte(data), 0644); err != nil {
-		level.Error(c.logger).Log("err", fmt.Sprintf("failed to write file: %v", err))
+		c.logger.Error("failed to write file to disk", "err", err.Error())
 		return err
 	}
 	c.metrics.configMapLastWriteSuccessTime.Set(float64(time.Now().Unix()))
@@ -262,7 +257,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 func (c *Controller) onConfigMapAdd(obj interface{}) {
 	cm, ok := obj.(*corev1.ConfigMap)
 	if !ok {
-		level.Error(c.logger).Log("msg", "unexpected object type", "type", fmt.Sprintf("%T", obj))
+		c.logger.Error("unexpected object type", "type", fmt.Sprintf("%T", obj))
 		return
 	}
 
@@ -292,10 +287,10 @@ func (c *Controller) onConfigMapUpdate(oldObj, newObj interface{}) {
 func (c *Controller) onConfigMapDelete(obj interface{}) {
 	cm, ok := obj.(*corev1.ConfigMap)
 	if !ok {
-		level.Error(c.logger).Log("msg", "unexpected object type", "type", fmt.Sprintf("%T", obj))
+		c.logger.Error("unexpected object type", "type", fmt.Sprintf("%T", obj))
 		return
 	}
-	level.Info(c.logger).Log("msg", "ConfigMap deleted - ignoring", "name", cm.Name, "namespace", cm.Namespace)
+	c.logger.Info("ConfigMap deleted - ignoring", "name", cm.Name, "namespace", cm.Namespace)
 }
 
 func (c *Controller) shouldEnqueue(cm *corev1.ConfigMap) bool {

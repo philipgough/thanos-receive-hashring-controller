@@ -1,4 +1,5 @@
 PROJECT_PATH := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+BIN_FOLDER=$(PROJECT_PATH)/bin
 
 REGISTRY ?= quay.io/philipgough
 TAG ?= latest
@@ -12,9 +13,15 @@ unit-test: ## Run unit tests
 	go test ./...
 
 .PHONY: integration-test
-integration-test: ## Run integration tests
-	go test -tags integration -run=TestCreateUpdateDeleteCycleNoCache -run=TestCreateUpdateDeleteCycleWithCache -run=TestCreateUpdateCycle ./...
+integration-test: tools ## Run integration tests
+	go test -tags integration ./...
 
 .PHONY: build-image
 build-image: ## Build docker image
 	docker build --tag $(REGISTRY)/$(IMAGE_NAME) .
+
+.PHONY: tools
+tools:
+	GOBIN=$(BIN_FOLDER) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+	$(BIN_FOLDER)/setup-envtest use --print env
+

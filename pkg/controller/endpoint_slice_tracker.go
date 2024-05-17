@@ -2,14 +2,14 @@ package controller
 
 import (
 	"fmt"
+	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-
 	discoveryv1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -23,17 +23,18 @@ type cacheKey string
 // in the format <EndpointSlice.Name>/<EndpointSlice.UID>
 type ownerRefUID string
 
-// hashring is a representation of Thanos hashring configuration
-// which caches the endpoints and their expiry time
-type hashring struct {
-	tenants   []string
+type cacheValue struct {
+	// endpoints are the list of 'active' endpoints for an EndpointSlice and their TTL
 	endpoints map[string]*time.Time
+	// value is the value of the cache entry as set by the implementer of Trackable
+	value interface{}
 }
 
 // ownerRefTracker is a map of hashrings for a given OwnerReference UUID
-type ownerRefTracker map[ownerRefUID]*hashring
+type ownerRefTracker map[ownerRefUID]*cacheValue
 
 type tracker struct {
+	trackable Trackable
 	// ttl is the TTL for endpoints in the hashring
 	// This is used to allow for involuntary disruptions to remain in the hashring
 	ttl *time.Duration
@@ -44,16 +45,26 @@ type tracker struct {
 	// now is a function that returns the current time
 	// it is used to allow for testing
 	now    func() time.Time
-	logger log.Logger
+	logger *slog.Logger
 }
 
-func newTracker(ttl *time.Duration, logger log.Logger) *tracker {
+func newTracker(ttl *time.Duration, logger *slog.Logger, trackable Trackable) *tracker {
 	return &tracker{
-		ttl:    ttl,
-		state:  make(map[cacheKey]ownerRefTracker),
-		now:    time.Now,
-		logger: logger,
+		trackable: trackable,
+		ttl:       ttl,
+		state:     make(map[cacheKey]ownerRefTracker),
+		now:       time.Now,
+		logger:    logger,
 	}
+}
+
+// GetEndpoints returns the list of active endpoints from the cachedValue.
+func (cv cacheValue) GetEndpoints() []string {
+	var endpoints []string
+	for endpoint := range cv.endpoints {
+		endpoints = append(endpoints, endpoint)
+	}
+	return endpoints
 }
 
 // saveOrMerge saves or merges an EndpointSlice into the cache
@@ -63,39 +74,42 @@ func (t *tracker) saveOrMerge(eps *discoveryv1.EndpointSlice) error {
 		return fmt.Errorf("saveOrMerge failed to generate cache key: %w", err)
 	}
 
-	updatedState, terminatingPods := t.toHashring(eps)
-	subKey := t.toSubKey(eps)
+	endpointState, err := t.parseEndpointsFromSlice(eps)
+	if err != nil {
+		return fmt.Errorf("save or Merge failed to parse endpoints from slice: %w", err)
+	}
 
+	subKey := t.toSubKey(eps)
 	if t.saveInPlace(key, subKey) {
-		t.setState(key, subKey, updatedState)
+		t.setState(key, subKey, t.toCacheValue(eps, endpointState.activeEndpoints))
 		return nil
 	}
 
 	// At this point we know the following is true:
 	// 1. we have seen this EndpointSlice for this Service before
-	// 2. we care about TTLs and we don't want to act on involuntary disruptions
-	// 3. we are going to mutate the state in some form or another so we need to lock
+	// 2. we care about TTLs, and we don't want to act instantaneously on involuntary disruptions
+	// 3. we are going to mutate the state in some form or another, and we need to lock
 	t.mut.Lock()
 	defer t.mut.Unlock()
 	existingStoredState, ok := t.state[key][subKey]
 	if !ok {
 		// this should never happen
-		return fmt.Errorf("saveOrMerge failed to find existing hashring for key %s and subKey %s", key, subKey)
+		return fmt.Errorf("saveOrMerge failed to find existing cached value for key %s and subKey %s", key, subKey)
 	}
 
-	// remove terminating Pods from the stored hashring
-	for _, hostname := range terminatingPods {
-		level.Info(t.logger).Log("msg", "evicting terminating endpoint from hashring",
-			"endpoint", hostname, "hashring", key, "subKey", subKey)
-		delete(existingStoredState.endpoints, hostname)
+	// remove terminating Pods from the stored cacheValue
+	for _, endpoint := range endpointState.terminatingEndpoints {
+		t.logger.Info("evicting terminating endpoint from cache",
+			"endpoint", endpoint, "key", key, "subKey", subKey)
+		delete(existingStoredState.endpoints, endpoint)
 	}
 
 	now := t.now()
 	for k, v := range existingStoredState.endpoints {
 		if v.Before(now) {
 			// check if the entry has been refreshed in this update
-			if _, ok := updatedState.endpoints[k]; !ok {
-				level.Info(t.logger).Log("msg", "evicting expired endpoint from hashring",
+			if _, ok := endpointState.activeEndpoints[k]; !ok {
+				t.logger.Info("evicting expired endpoint from hashring",
 					"endpoint", k, "hashring", key, "subKey", subKey)
 				delete(existingStoredState.endpoints, k)
 			}
@@ -103,10 +117,12 @@ func (t *tracker) saveOrMerge(eps *discoveryv1.EndpointSlice) error {
 	}
 
 	// add/refresh our TTLs by merging back in our updates
-	for k, v := range updatedState.endpoints {
+	for k, v := range endpointState.activeEndpoints {
 		existingStoredState.endpoints[k] = v
 	}
 
+	newCacheValue := t.toCacheValue(eps, existingStoredState.endpoints)
+	t.state[key][subKey] = newCacheValue
 	return nil
 }
 
@@ -130,52 +146,23 @@ func (t *tracker) evict(eps *discoveryv1.EndpointSlice) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	level.Info(t.logger).Log("msg", "evicting hashring shard", "hashring", key, "shard", subKey)
+	t.logger.Info("evicting endpointslice shard", "key", key, "shard", subKey)
 	// remove this shard
 	delete(state, subKey)
 	// check if we have any shards left
 	if len(state) == 0 {
-		level.Info(t.logger).Log("msg", "evicting hashring", "hashring", key)
+		t.logger.Info("evicting key", "key", key)
 		// delete the hashring entirely if not
 		delete(t.state, key)
 	}
 	return true, nil
 }
 
-func (t *tracker) deepCopyState() map[cacheKey]ownerRefTracker {
-	t.mut.RLock()
-	defer t.mut.RUnlock()
-
-	newState := make(map[cacheKey]ownerRefTracker, len(t.state))
-
-	for name, refTracker := range t.state {
-		newOwnerRefTracker := make(ownerRefTracker)
-		for subKey, hashringState := range refTracker {
-			newHashring := &hashring{
-				tenants:   append([]string(nil), hashringState.tenants...),
-				endpoints: make(map[string]*time.Time, len(hashringState.endpoints)),
-			}
-			for endpoint, expiry := range hashringState.endpoints {
-				var newExpiry *time.Time
-				if expiry != nil {
-					newExpiry = new(time.Time)
-					*newExpiry = *expiry
-				}
-				newHashring.endpoints[endpoint] = newExpiry
-			}
-			newOwnerRefTracker[subKey] = newHashring
-		}
-		newState[name] = newOwnerRefTracker
-	}
-
-	return newState
-}
-
-func (t *tracker) setState(key cacheKey, subKey ownerRefUID, value *hashring) {
+func (t *tracker) setState(key cacheKey, subKey ownerRefUID, value *cacheValue) {
 	t.mut.Lock()
 	defer t.mut.Unlock()
 	if _, ok := t.state[key]; !ok {
-		t.state[key] = make(map[ownerRefUID]*hashring)
+		t.state[key] = make(map[ownerRefUID]*cacheValue)
 	}
 
 	t.state[key][subKey] = value
@@ -202,43 +189,67 @@ func (t *tracker) hasStateForSubKey(key cacheKey, subKey ownerRefUID) bool {
 	return true
 }
 
-// toHashring converts an EndpointSlice into a hashring
-// It adds all ready endpoints to the hashring and sets the TTL if provided
-// It returns a list of terminating Pods to be considered for eviction
-func (t *tracker) toHashring(eps *discoveryv1.EndpointSlice) (*hashring, []string) {
-	var terminatingPods []string
-	var endpoints = make(map[string]*time.Time)
+type endpointsResult struct {
+	activeEndpoints      map[string]*time.Time
+	terminatingEndpoints []string
+}
 
-	var ttl *time.Time
+func (t *tracker) parseEndpointsFromSlice(eps *discoveryv1.EndpointSlice) (endpointsResult, error) {
+	var (
+		ttl    *time.Time
+		result = endpointsResult{
+			activeEndpoints: make(map[string]*time.Time),
+		}
+	)
+
 	if t.ttl != nil {
 		newTTL := t.now().Add(*t.ttl)
 		ttl = &newTTL
 	}
 
 	for _, endpoint := range eps.Endpoints {
-		if endpoint.Hostname == nil {
-			level.Warn(t.logger).Log(
-				"msg", "EndpointSlice endpoint has no hostname - skipping", "endpoint", endpoint)
+		t.logger.Debug("parsing endpoint", "endpoint", endpoint.String())
+		createEndpointString := t.trackable.EndpointBuilder()
+		ep, err := createEndpointString(eps, endpoint)
+		if err != nil {
+			t.logger.Warn("EndpointSlice endpoint has no hostname - skipping", "endpoint", endpoint.String())
 			continue
 		}
 
 		if endpoint.Conditions.Terminating != nil && *endpoint.Conditions.Terminating == true {
 			// this is a voluntary disruption, so we should remove it from the hashring
 			// it might be an indication of a scale down event or rolling update etc
-			terminatingPods = append(terminatingPods, *endpoint.Hostname)
+			result.terminatingEndpoints = append(result.terminatingEndpoints, ep)
+			t.logger.Debug("found terminating endpoint", "endpoint", ep)
 			continue
 		}
 
 		// we only care about ready endpoints in terms of adding nodes to the hashring
 		if endpoint.Conditions.Ready != nil && *endpoint.Conditions.Ready == true {
-			endpoints[*endpoint.Hostname] = ttl
+			t.logger.Debug("found active endpoint", "endpoint", ep)
+			result.activeEndpoints[ep] = ttl
 		}
 	}
+	return result, nil
+}
 
-	return &hashring{
-		tenants:   t.getTenants(eps),
-		endpoints: endpoints,
-	}, terminatingPods
+// toCacheValue converts an EndpointSlice and the active endpoints into a cacheValue.
+func (t *tracker) toCacheValue(eps *discoveryv1.EndpointSlice, activeEndpoints map[string]*time.Time) *cacheValue {
+	var endpoints []string
+	for k, _ := range activeEndpoints {
+		endpoints = append(endpoints, k)
+	}
+
+	value, err := t.trackable.SetValueFor(eps, endpoints)
+	if err != nil {
+		t.logger.Error("failed to set value for EndpointSlice", "name", eps.GetName(), "error", err.Error())
+		return nil
+	}
+
+	return &cacheValue{
+		endpoints: activeEndpoints,
+		value:     value,
+	}
 }
 
 func (t *tracker) generateCacheKey(eps *discoveryv1.EndpointSlice) (cacheKey, error) {
@@ -248,34 +259,7 @@ func (t *tracker) generateCacheKey(eps *discoveryv1.EndpointSlice) (cacheKey, er
 			eps.Namespace, eps.Name, discoveryv1.LabelServiceName)
 	}
 
-	name, ok := t.getHashringName(eps)
-	if !ok || name == "" {
-		name = key
-	}
-
-	return cacheKey(fmt.Sprintf("%s/%s", name, key)), nil
-}
-
-// unwrapCacheKey returns the hashring name and the name of the service
-func (t *tracker) unwrapCacheKey(key cacheKey) (string, string) {
-	parts := strings.Split(string(key), "/")
-	if len(parts) == 1 {
-		return parts[0], parts[0]
-	}
-	return parts[0], parts[1]
-}
-
-func (t *tracker) getHashringName(eps *discoveryv1.EndpointSlice) (string, bool) {
-	name, ok := eps.GetLabels()[HashringNameIdentifierLabel]
-	return name, ok
-}
-
-func (t *tracker) getTenants(eps *discoveryv1.EndpointSlice) []string {
-	tenant, ok := eps.GetLabels()[TenantIdentifierLabel]
-	if !ok {
-		return []string{}
-	}
-	return []string{tenant}
+	return cacheKey(key), nil
 }
 
 func (t *tracker) toSubKey(eps *discoveryv1.EndpointSlice) ownerRefUID {
@@ -291,4 +275,43 @@ func (t *tracker) fromSubKey(subKey ownerRefUID) (name string, uid types.UID) {
 	name = parts[0]
 	uid = types.UID(parts[1])
 	return name, uid
+}
+
+// generate outputs the sorted hashrings that are currently in the cache.
+// It does not look at TTLs and takes anything that is in the cache
+// as the source of truth. It is read only and safe to call concurrently.
+func (t *tracker) generate() (string, []metav1.OwnerReference, error) {
+	t.mut.RLock()
+	defer t.mut.RUnlock()
+	var owners []metav1.OwnerReference
+
+	var groupedValues [][]interface{}
+	for _, ownerRefs := range t.state {
+		var values []interface{}
+		for nameAndUID, cachedValue := range ownerRefs {
+			owners = append(owners, t.buildOwnerReference(nameAndUID))
+			values = append(values, cachedValue.value)
+		}
+		groupedValues = append(groupedValues, values)
+	}
+
+	// sort the owners to avoid flapping on the ConfigMap
+	sort.Slice(owners, func(i, j int) bool { return owners[i].Name < owners[j].Name })
+	output, err := t.trackable.Generate(groupedValues)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return output, owners, nil
+}
+
+func (t *tracker) buildOwnerReference(key ownerRefUID) metav1.OwnerReference {
+	name, uid := t.fromSubKey(key)
+
+	return metav1.OwnerReference{
+		APIVersion: discoveryv1.SchemeGroupVersion.String(),
+		Kind:       "EndpointSlice",
+		Name:       name,
+		UID:        uid,
+	}
 }

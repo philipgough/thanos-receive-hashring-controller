@@ -2,15 +2,10 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"k8s.io/utils/pointer"
-	"sort"
+	"log/slog"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/philipgough/hashring-controller/pkg/config"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"golang.org/x/time/rate"
@@ -19,10 +14,13 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	kubeinformers "k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	discoveryinformers "k8s.io/client-go/informers/discovery/v1"
+	"k8s.io/client-go/kubernetes"
 	clientset "k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
@@ -30,36 +28,70 @@ import (
 	"k8s.io/client-go/util/workqueue"
 )
 
+// EndpointBuilderFN is a function that builds an endpoint string from an Endpoint and an EndpointSlice
+type EndpointBuilderFN func(eps *discoveryv1.EndpointSlice, ep discoveryv1.Endpoint) (string, error)
+
+type Trackable interface {
+	// EndpointBuilder builds the endpoint string for a given Endpoint.
+	EndpointBuilder() EndpointBuilderFN
+	// SetValueFor sets the value for the given EndpointSlice and Endpoints in the cache.
+	// validEndpoints is a list of Endpoints that are valid (as per the cache behaviour) for the given EndpointSlice.
+	SetValueFor(eps *discoveryv1.EndpointSlice, endpoints []string) (interface{}, error)
+	// Generate returns the value that will be set in the ConfigMap.
+	// A value is a group of EndpointSlices that share the same Service.
+	// The caller is responsible for ensuring data deduplication within the output if required.
+	Generate(values [][]interface{}) (string, error)
+}
+
 const (
-	// ServiceLabel *must* be set to 'true' on a corev1.Service that should be watched by the Controller
-	ServiceLabel = "thanos.receive.hashring.controller/watch"
-	// HashringNameIdentifierLabel is an optional label that is used by the controller to identify the hashring name.
-	// A missing/empty value defaults to the name of the Service.
-	HashringNameIdentifierLabel = "hashring.controller.io/hashring"
-	// TenantIdentifierLabel is an optional label that is used by the controller to identify a tenant for the hashring
-	// When relying on default behaviour for the controller, the absence of this label
-	// on a Service will result in an empty tenant list which matches all tenants providing soft-tenancy
-	TenantIdentifierLabel = "hashring.controller.io/tenant"
-	// AlgorithmIdentifierLabel is the label that is used by the controller to identify the hashring algorithm
-	// When relying on default behaviour for the controller, the absence of this label
-	// on a Service will result in the use of config.DefaultAlgorithm
-	AlgorithmIdentifierLabel = "hashring.controller.io/hashing-algorithm"
-
-	// DefaultConfigMapName is the default name for the generated ConfigMap
-	DefaultConfigMapName = "hashring-controller-generated-config"
-	// ConfigMapLabel is the label that is used to identify configmaps that is managed by the controller
-	ConfigMapLabel = "hashring.controller.io/managed"
-
-	// DefaultConfigMapKey is the default key for the generated ConfigMap
-	DefaultConfigMapKey  = "hashrings.json"
-	defaultPort          = "10901"
-	defaultClusterDomain = "cluster.local"
+	// DefaultServiceLabel is the default label that marks that headless Service.
+	// should be watched by the Controller. The value of the label must be "true".
+	DefaultServiceLabel = "endpointslice.controller.io/watch"
+	// DefaultConfigMapName is the default name for the generated ConfigMap.
+	DefaultConfigMapName = "endpointslice-controller-generated-config"
+	// DefaultConfigMapLabel is the default label that is used to identify ConfigMaps that are managed by the controller.
+	DefaultConfigMapLabel = "endpointslice.controller.io/managed"
+	// DefaultConfigMapKey is the default key for data insertion on the generated ConfigMap.
+	DefaultConfigMapKey = "data.json"
+	// DefaultReSyncPeriod is the default period at which the controller will resync.
+	DefaultReSyncPeriod = time.Minute
 
 	// defaultSyncBackOff is the default backoff period for syncService calls.
 	defaultSyncBackOff = 1 * time.Second
 	// maxSyncBackOff is the max backoff period for sync calls.
 	maxSyncBackOff = 1000 * time.Second
 )
+
+// Config is the configuration for the Controller.
+type Config struct {
+	// ReSyncPeriod is the period at which the controller will resync.
+	ReSyncPeriod time.Duration
+	// ServiceLabel is the label that marks that headless Service should be watched by the Controller.
+	// The value of the label must be "true".
+	ServiceLabel string
+	// ConfigMapName is the name for the generated ConfigMap.
+	ConfigMapName string
+	// ConfigMapKey is the key for data insertion on the generated ConfigMap.
+	ConfigMapKey string
+	// ConfigMapLabel is the label that is used to identify ConfigMaps that are managed by the controller.
+	ConfigMapLabel string
+	// TTL controls the duration for which expired entries are kept in the cache.
+	// By default, an endpoint is considered expired if it has become unready due to an involuntary disruption.
+	// A nil value disables TTL.
+	TTL *time.Duration
+}
+
+// DefaultConfig returns the default configuration for the Controller.
+func DefaultConfig() Config {
+	return Config{
+		ReSyncPeriod:   DefaultReSyncPeriod,
+		ServiceLabel:   DefaultServiceLabel,
+		ConfigMapName:  DefaultConfigMapName,
+		ConfigMapKey:   DefaultConfigMapKey,
+		ConfigMapLabel: DefaultConfigMapLabel,
+		TTL:            nil,
+	}
+}
 
 // Controller manages selector-based service endpoint slices
 type Controller struct {
@@ -93,55 +125,24 @@ type Controller struct {
 
 	//tracker is used to track the status of the controller
 	tracker *tracker
-
-	// configMapName is the name of the configmap that the controller will generate
-	configMapName string
-	// configMapKey is the key of the configmap that the controller will generate
-	configMapKey string
-	// port is the port that the controller will generate a hashring for
-	port string
-	// clusterDomain is the cluster domain that the controller will generate a hashring for
-	clusterDomain string
-	// namespace is the namespace of the configmap that the controller will generate
+	// trackable is the implementation of the Trackable interface that will be cached and generated
+	trackable Trackable
 	namespace string
-	// buildFQDN is a function that builds a FQDN from a hostname and a service name
-	buildFQDN func(hostname, serviceName string) string
-	logger    log.Logger
+	config    Config
+	logger    *slog.Logger
 	metrics   *metrics
 }
 
-// Options provides a source to override default controller behaviour
-type Options struct {
-	// TTL controls the duration for which expired entries are kept in the cache
-	// If not set, no TTL will be applied
-	// Only Endpoints that have become unready due to an involuntary disruption are cached
-	// Terminated Endpoints are removed from the hashring in all cases
-	TTL *time.Duration
-	// ConfigMapKey is the key for hashring config on the generated ConfigMap
-	ConfigMapKey *string
-	// ConfigMapName is the name of the generated ConfigMap
-	ConfigMapName *string
-	// Port is the port that the hashring will be generated for
-	Port *string
-	// ClusterDomain is the cluster domain that the hashring will be generated for
-	ClusterDomain *string
-}
-
 func NewController(
-	ctx context.Context,
 	endpointSliceInformer discoveryinformers.EndpointSliceInformer,
 	configMapInformer coreinformers.ConfigMapInformer,
 	client clientset.Interface,
+	trackable Trackable,
 	namespace string,
-	opts *Options,
-	logger log.Logger,
+	config Config,
+	logger *slog.Logger,
 	registry *prometheus.Registry,
 ) *Controller {
-	opts = buildOpts(opts)
-
-	if logger == nil {
-		logger = log.NewNopLogger()
-	}
 
 	ctrlMetrics := newMetrics()
 	if registry == nil {
@@ -149,11 +150,7 @@ func NewController(
 	}
 
 	c := &Controller{
-		client:        client,
-		configMapName: *opts.ConfigMapName,
-		configMapKey:  *opts.ConfigMapKey,
-		port:          *opts.Port,
-		clusterDomain: *opts.ClusterDomain,
+		client: client,
 		// This is similar to the DefaultControllerRateLimiter, just with a
 		// significantly higher default backoff (1s vs 5ms). A more significant
 		// rate limit back off here helps ensure that the Controller does not
@@ -168,21 +165,11 @@ func NewController(
 			workqueue.RateLimitingQueueConfig{Name: "endpoint_slice"}),
 		workerLoopPeriod: time.Second,
 		namespace:        namespace,
-		tracker:          newTracker(opts.TTL, log.With(logger, "component", "endpointslice_tracker")),
+		config:           config,
+		tracker:          newTracker(config.TTL, logger.With("component", "endpointslice_tracker"), trackable),
 		logger:           logger,
 		metrics:          ctrlMetrics,
 	}
-
-	c.buildFQDN = c.defaultBuildFQDN
-
-	endpointSliceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    c.onEndpointSliceAdd,
-		UpdateFunc: c.onEndpointSliceUpdate,
-		DeleteFunc: c.onEndpointSliceDelete,
-	})
-
-	c.endpointSliceLister = endpointSliceInformer.Lister()
-	c.endpointSlicesSynced = endpointSliceInformer.Informer().HasSynced
 
 	configMapInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.handleObject,
@@ -202,29 +189,71 @@ func NewController(
 	c.configMapLister = configMapInformer.Lister()
 	c.configMapSynced = configMapInformer.Informer().HasSynced
 
+	endpointSliceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.onEndpointSliceAdd,
+		UpdateFunc: c.onEndpointSliceUpdate,
+		DeleteFunc: c.onEndpointSliceDelete,
+	})
+
+	c.endpointSliceLister = endpointSliceInformer.Lister()
+	c.endpointSlicesSynced = endpointSliceInformer.Informer().HasSynced
+
 	return c
 }
 
-// EnsureConfigMapExists ensures that the controller's configmap exists or tries to create it with an empty hashring
-func (c *Controller) EnsureConfigMapExists(ctx context.Context) error {
+// EnsureConfigMapExists ensures that the controller's configmap exists or tries to create it if not.
+// If the configmap already exists, it will be returned. If it does not exist, it will be created.
+// The returned boolean indicates whether the configmap was created or not.
+func (c *Controller) EnsureConfigMapExists(ctx context.Context, data string) (*corev1.ConfigMap, bool, error) {
+	var cm *corev1.ConfigMap
 	var pollError error
+	preExists := true
 	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, time.Minute, false, func(ctx context.Context) (bool, error) {
-		_, err := c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, c.configMapName, metav1.GetOptions{})
-		if err != nil {
-			if errors.IsNotFound(err) {
-				_, pollError = c.client.CoreV1().ConfigMaps(c.namespace).Create(
-					ctx, c.newConfigMap(`[{"hashring":"default","endpoints":[],"tenants":[]}]`, nil), metav1.CreateOptions{})
+		var fetchError error
+		cm, fetchError = c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, c.config.ConfigMapName, metav1.GetOptions{})
+		if fetchError != nil {
+
+			if errors.IsNotFound(fetchError) {
+				preExists = false
+				cm, pollError = c.client.CoreV1().ConfigMaps(c.namespace).
+					Create(ctx, c.newConfigMap(data, nil), metav1.CreateOptions{})
 				return false, nil
 			}
 		}
-
 		return true, nil
 	})
 	if err != nil {
-		return fmt.Errorf("failed to ensure configmap exists: %w: %w", err, pollError)
+		return cm, preExists, fmt.Errorf("failed to ensure configmap exists: %w: %w", err, pollError)
 	}
 
-	return nil
+	return cm, preExists, nil
+}
+
+// InformersFromConfig is a helper that returns the informers for the controller based on the given configuration.
+func InformersFromConfig(
+	client kubernetes.Interface,
+	namespace string,
+	config Config,
+) (kubeinformers.SharedInformerFactory, kubeinformers.SharedInformerFactory) {
+
+	endpointSliceInformer := kubeinformers.NewSharedInformerFactoryWithOptions(
+		client,
+		config.ReSyncPeriod,
+		kubeinformers.WithNamespace(namespace),
+		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = labels.Set{config.ServiceLabel: "true"}.String()
+		}),
+	)
+
+	configMapInformer := kubeinformers.NewSharedInformerFactoryWithOptions(
+		client,
+		config.ReSyncPeriod,
+		kubeinformers.WithNamespace(namespace),
+		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = labels.Set{config.ConfigMapLabel: "true"}.String()
+		}),
+	)
+	return endpointSliceInformer, configMapInformer
 }
 
 // Run will set up the event handlers for types we are interested in, as well
@@ -236,21 +265,21 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 	defer c.queue.ShutDown()
 
 	// Start the informer factories to begin populating the informer caches
-	level.Info(c.logger).Log("msg", "starting hashring controller")
-	level.Info(c.logger).Log("msg", "waiting for informer caches to sync")
+	c.logger.Info("starting hashring controller")
+	c.logger.Info("waiting for informer caches to sync")
 
 	if ok := cache.WaitForCacheSync(ctx.Done(), c.endpointSlicesSynced, c.configMapSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	level.Info(c.logger).Log("msg", "starting workers", "count", workers)
+	c.logger.Info("starting workers", slog.Int("count", workers))
 	for i := 0; i < workers; i++ {
 		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
 
-	level.Info(c.logger).Log("msg", "started workers")
+	c.logger.Info("started workers")
 	<-ctx.Done()
-	level.Info(c.logger).Log("msg", "shutting down workers")
+	c.logger.Info("shutting down workers")
 
 	return nil
 }
@@ -300,7 +329,7 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 		// Finally, if no error occurs we Forget this item so it does not
 		// get queued again until another change happens.
 		c.queue.Forget(obj)
-		level.Debug(c.logger).Log("msg", "successfully synced", "resourceName", key)
+		c.logger.Debug("successfully synced", "resourceName", key)
 		return nil
 	}(obj)
 
@@ -327,7 +356,7 @@ func (c *Controller) enqueueEndpointSlice(obj interface{}) {
 
 // syncHandler compares the actual state with the desired, and attempts to converge the two.
 func (c *Controller) syncHandler(ctx context.Context, key string) error {
-	level.Debug(c.logger).Log("msg", "syncHandler called", "resourceName", key)
+	c.logger.Debug("syncHandler called", "resourceName", key)
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
@@ -346,7 +375,8 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		return err
 	}
 
-	if err := c.tracker.saveOrMerge(eps); err != nil {
+	epsCopied := eps.DeepCopy()
+	if err := c.tracker.saveOrMerge(epsCopied); err != nil {
 		utilruntime.HandleError(fmt.Errorf("syncHandler failed to reconcile resource key: %s", key))
 		return err
 	}
@@ -356,17 +386,18 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 
 // reconcile compares the actual state with the desired, and attempts to converge the two.
 func (c *Controller) reconcile(ctx context.Context) error {
-	hashrings, owners := c.generate(c.tracker.deepCopyState())
-
-	hashringConfig, err := json.Marshal(hashrings)
+	output, owners, err := c.tracker.generate()
 	if err != nil {
-		return err
+		// we log and return here because we don't want to requeue the item
+		c.logger.Error("failed to generate output during reconcile", "error", err.Error())
+		return nil
 	}
+
 	// Get the ConfigMap or create it if it doesn't exist.
-	cm, err := c.configMapLister.ConfigMaps(c.namespace).Get(c.configMapName)
+	cm, err := c.configMapLister.ConfigMaps(c.namespace).Get(c.config.ConfigMapName)
 	if errors.IsNotFound(err) {
 		cm, err = c.client.CoreV1().ConfigMaps(c.namespace).Create(ctx,
-			c.newConfigMap(string(hashringConfig), owners), metav1.CreateOptions{})
+			c.newConfigMap(output, owners), metav1.CreateOptions{})
 	}
 
 	// If an error occurs during Get/Create, we'll requeue the item so we can
@@ -376,9 +407,9 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		return err
 	}
 
-	if cm.Data[c.configMapKey] != string(hashringConfig) {
+	if cm.Data[c.config.ConfigMapKey] != output {
 		_, err = c.client.CoreV1().ConfigMaps(c.namespace).Update(
-			ctx, c.newConfigMap(string(hashringConfig), owners), metav1.UpdateOptions{})
+			ctx, c.newConfigMap(output, owners), metav1.UpdateOptions{})
 	}
 
 	// If an error occurs during Update, we'll requeue the item so we can
@@ -389,41 +420,9 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	}
 
 	c.metrics.configMapLastChangeSuccessTime.Set(float64(time.Now().Unix()))
-	c.metrics.configMapLastChangeSuccessTime.Set(hashAsMetricValue(hashringConfig))
+	// todo add as hook
+	//c.metrics.configMapLastChangeSuccessTime.Set(hashAsMetricValue(hashringConfig))
 	return nil
-}
-
-// generate outputs the sorted hashrings that are currently in the cache.
-// It does not look at TTLs and takes anything that is in the cache
-// as the source of truth. It is read only and safe to call concurrently.
-func (c *Controller) generate(state map[cacheKey]ownerRefTracker) (config.Hashrings, []metav1.OwnerReference) {
-	var owners []metav1.OwnerReference
-	generated := config.Hashrings{}
-
-	for cacheKey, ownerRefs := range state {
-		hashringName, svcName := c.tracker.unwrapCacheKey(cacheKey)
-
-		for nameAndUID, _ := range ownerRefs {
-			owners = append(owners, c.buildOwnerReference(nameAndUID))
-		}
-
-		sortedTenants, sortedEndpoints := c.deduplicateAndSortByOwnerRef(svcName, ownerRefs)
-
-		generated = append(generated, config.Hashring{
-			HashringSpec: config.HashringSpec{
-				Name:    hashringName,
-				Tenants: sortedTenants,
-			},
-			Endpoints: sortedEndpoints,
-		})
-	}
-
-	sort.Sort(generated)
-	sort.Slice(owners, func(i, j int) bool {
-		return owners[i].Name < owners[j].Name
-	})
-
-	return generated, owners
 }
 
 // newConfigMap creates a new ConfigMap
@@ -431,72 +430,24 @@ func (c *Controller) generate(state map[cacheKey]ownerRefTracker) (config.Hashri
 func (c *Controller) newConfigMap(data string, owners []metav1.OwnerReference) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      c.configMapName,
+			Name:      c.config.ConfigMapName,
 			Namespace: c.namespace,
 			Labels: map[string]string{
-				ConfigMapLabel: "true",
+				c.config.ConfigMapLabel: "true",
 			},
 			OwnerReferences: owners,
 		},
 		Data: map[string]string{
-			DefaultConfigMapKey: data,
+			c.config.ConfigMapKey: data,
 		},
 		BinaryData: nil,
 	}
 }
 
-func (c *Controller) buildOwnerReference(key ownerRefUID) metav1.OwnerReference {
-	name, uid := c.tracker.fromSubKey(key)
-
-	return metav1.OwnerReference{
-		APIVersion: discoveryv1.SchemeGroupVersion.String(),
-		Kind:       "EndpointSlice",
-		Name:       name,
-		UID:        uid,
-	}
-}
-
-// deduplicateAndSortByOwnerRef takes the overarching Service owner and a map of ownerRefs and
-// returns a deduplicated and sorted list of tenants and endpoints
-func (c *Controller) deduplicateAndSortByOwnerRef(svc string, ownerRefs ownerRefTracker) (tenants, endpoints []string) {
-	aggregatedTenants := make(map[string]struct{})
-	aggregatedEndpoints := make(map[string]struct{})
-
-	for _, data := range ownerRefs {
-		for _, tenant := range data.tenants {
-			aggregatedTenants[tenant] = struct{}{}
-		}
-		for endpoint, _ := range data.endpoints {
-			aggregatedEndpoints[endpoint] = struct{}{}
-		}
-	}
-
-	endpoints = make([]string, 0, len(aggregatedEndpoints))
-	for endpoint, _ := range aggregatedEndpoints {
-		endpoints = append(endpoints, c.buildFQDN(endpoint, svc))
-	}
-
-	tenants = make([]string, 0, len(aggregatedTenants))
-	for tenant, _ := range aggregatedTenants {
-		tenants = append(tenants, tenant)
-	}
-
-	sort.Strings(endpoints)
-	sort.Strings(tenants)
-	return tenants, endpoints
-}
-
-// defaultBuildFQDN builds the FQDN for a given hostname
-// https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#stable-network-id
-func (c *Controller) defaultBuildFQDN(hostname, serviceName string) string {
-	return fmt.Sprintf("%s.%s.%s.svc.%s:%s",
-		hostname, serviceName, c.namespace, defaultClusterDomain, defaultPort)
-}
-
 func (c *Controller) onEndpointSliceAdd(obj interface{}) {
 	eps, ok := obj.(*discoveryv1.EndpointSlice)
 	if !ok {
-		level.Error(c.logger).Log("msg", "unexpected object type", "type", fmt.Sprintf("%T", obj))
+		c.logger.Error("unexpected object type", "type", fmt.Sprintf("%T", obj))
 		return
 	}
 
@@ -526,7 +477,7 @@ func (c *Controller) onEndpointSliceUpdate(oldObj, newObj interface{}) {
 func (c *Controller) onEndpointSliceDelete(obj interface{}) {
 	eps, ok := obj.(*discoveryv1.EndpointSlice)
 	if !ok {
-		level.Error(c.logger).Log("msg", "unexpected object type", "type", fmt.Sprintf("%T", obj))
+		c.logger.Error("unexpected object type", "type", fmt.Sprintf("%T", obj))
 		return
 	}
 
@@ -560,9 +511,9 @@ func (c *Controller) handleObject(obj interface{}) {
 			utilruntime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type"))
 			return
 		}
-		level.Info(c.logger).Log("msg", "recovered deleted object", "resourceName", object.GetName())
+		c.logger.Info("recovered deleted object", "resourceName", object.GetName())
 	}
-	level.Info(c.logger).Log("msg", "processing object", "object", object.GetName())
+	c.logger.Info("processing object", "object", object.GetName())
 	ownerRefs := object.GetOwnerReferences()
 
 	for _, ownerRef := range ownerRefs {
@@ -572,7 +523,7 @@ func (c *Controller) handleObject(obj interface{}) {
 
 		eps, err := c.endpointSliceLister.EndpointSlices(object.GetNamespace()).Get(ownerRef.Name)
 		if err != nil {
-			level.Info(c.logger).Log("msg", "ignore orphaned object",
+			c.logger.Info("ignore orphaned object",
 				"object", object.GetName(), "owner", ownerRef.Name)
 			return
 		}
@@ -587,32 +538,4 @@ func (c *Controller) shouldEnqueue(eps *discoveryv1.EndpointSlice) bool {
 		return false
 	}
 	return true
-}
-
-func buildOpts(o *Options) *Options {
-	if o == nil {
-		o = &Options{
-			TTL:           nil,
-			ConfigMapName: pointer.String(DefaultConfigMapName),
-			ConfigMapKey:  pointer.String(DefaultConfigMapKey),
-			Port:          pointer.String(defaultPort),
-			ClusterDomain: pointer.String(defaultClusterDomain),
-		}
-		return o
-	}
-
-	if o.ConfigMapName == nil {
-		o.ConfigMapName = pointer.String(DefaultConfigMapName)
-	}
-	if o.ConfigMapKey == nil {
-		o.ConfigMapKey = pointer.String(DefaultConfigMapKey)
-	}
-	if o.Port == nil {
-		o.Port = pointer.String(defaultPort)
-	}
-	if o.ClusterDomain == nil {
-		o.ClusterDomain = pointer.String(defaultClusterDomain)
-	}
-
-	return o
 }

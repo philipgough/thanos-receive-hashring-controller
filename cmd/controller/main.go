@@ -1,34 +1,37 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	stdlog "log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/go-kit/kit/log/level"
-	"github.com/go-kit/log"
-	"github.com/oklog/run"
 	"github.com/philipgough/hashring-controller/pkg/controller"
 	"github.com/philipgough/hashring-controller/pkg/signals"
+	"github.com/philipgough/hashring-controller/pkg/thanos"
+
+	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 const (
-	defaultListen = ":8080"
-
-	resyncPeriod = time.Minute
+	defaultListen     = ":8080"
+	defaultLogLevel   = "info"
+	defaultTTLSeconds = 600
+	// defaultInitialHashring is the default initial hashring to use if the ConfigMap does not exist.
+	// This allows Thanos to pass initial validation and start the process.
+	defaultInitialHashring = `[{"endpoints":["127.0.0.1:1234","127.0.0.1:1234","127.0.0.1:12345"]}]`
 )
 
 var (
@@ -36,7 +39,12 @@ var (
 	kubeconfig string
 	namespace  string
 
-	listen string
+	listen     string
+	logLevel   string
+	ttlSeconds int
+
+	hashring string
+	static   bool
 )
 
 func main() {
@@ -58,10 +66,10 @@ func main() {
 		stdlog.Fatalf("error listening on %s: %s", defaultListen, err.Error())
 	}
 
-	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
-	logger = log.WithPrefix(logger, "ts", log.DefaultTimestampUTC)
-	logger = log.WithPrefix(logger, "caller", log.DefaultCaller)
-	logger = log.With(logger, "component", "hashring-controller")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: getLogLevel(logLevel),
+	}))
+	logger = logger.With("component", "hashring-controller")
 
 	r := prometheus.NewRegistry()
 	r.MustRegister(
@@ -72,38 +80,46 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{}))
 
-	endpointSliceInformer := kubeinformers.NewSharedInformerFactoryWithOptions(
-		kubeClient,
-		resyncPeriod,
-		kubeinformers.WithNamespace(namespace),
-		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{controller.ServiceLabel: "true"}.String()
-		}),
-	)
-
-	configMapInformer := kubeinformers.NewSharedInformerFactoryWithOptions(
-		kubeClient,
-		resyncPeriod,
-		kubeinformers.WithNamespace(namespace),
-		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labels.Set{controller.ConfigMapLabel: "true"}.String()
-		}),
-	)
+	config := controller.DefaultConfig()
+	endpointSliceInformer, configMapInformer := controller.InformersFromConfig(kubeClient, namespace, config)
 
 	controller := controller.NewController(
-		ctx,
 		endpointSliceInformer.Discovery().V1().EndpointSlices(),
 		configMapInformer.Core().V1().ConfigMaps(),
 		kubeClient,
+		thanos.NewReceiveHashringController(nil, nil),
 		namespace,
-		nil,
+		controller.DefaultConfig(),
 		logger,
 		r,
 	)
 
-	// todo protect this with a flag
-	if err := controller.EnsureConfigMapExists(ctx); err != nil {
+	// Check for existence of ConfigMap or create it if it doesn't exist.
+	cm, alreadyExists, err := controller.EnsureConfigMapExists(ctx, hashring)
+	if err != nil {
 		stdlog.Fatalf("error ensuring configmap exists: %s", err.Error())
+	}
+
+	if !alreadyExists {
+		// assume we are in bootstrap mode, and the ConfigMap did not exist.
+		// Give some time for Thanos Receive to start up and validate the ConfigMap.
+		logger.Info("ConfigMap did not exist, waiting for Thanos Receive to start up")
+		<-time.After(time.Minute)
+	}
+
+	if static {
+		logger.Warn("static mode enabled, no reconciliation will occur")
+		cm.Data[config.ConfigMapKey] = hashring
+		if _, err := kubeClient.CoreV1().ConfigMaps(namespace).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+			stdlog.Fatalf("error updating configmap: %s", err.Error())
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				logger.Info("controller exited gracefully from static mode")
+				os.Exit(0)
+			}
+		}
 	}
 
 	var g run.Group
@@ -124,7 +140,7 @@ func main() {
 			mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
 			})
-			if err := http.Serve(l, mux); err != nil && err != http.ErrServerClosed {
+			if err := http.Serve(l, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return fmt.Errorf("server error: %w", err)
 			}
 			return nil
@@ -138,12 +154,47 @@ func main() {
 	if err := g.Run(); err != nil {
 		stdlog.Fatalf("error running controller: %s", err.Error())
 	}
-	level.Info(logger).Log("msg", "controller stopped gracefully")
+	logger.Info("controller stopped gracefully")
+	os.Exit(0)
 }
 
 func init() {
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
-	flag.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
-	flag.StringVar(&namespace, "namespace", metav1.NamespaceDefault, "The namespace to watch")
-	flag.StringVar(&listen, "listen", defaultListen, "The address to listen on")
+	flag.StringVar(&kubeconfig, "kubeconfig", "",
+		"Path to a kubeconfig. Only required if out-of-cluster.")
+	flag.StringVar(&masterURL, "master", "",
+		"The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
+	flag.StringVar(&namespace, "namespace", metav1.NamespaceDefault,
+		"The namespace to watch")
+	flag.StringVar(&listen, "listen", defaultListen,
+		"The address to listen on.")
+	flag.StringVar(&logLevel, "log-level", defaultLogLevel,
+		"The log level to use.")
+	flag.IntVar(&ttlSeconds, "ttl", defaultTTLSeconds,
+		"The number of seconds to cache endpoints which have become unready due to involuntary disruption.")
+	flag.StringVar(
+		&hashring,
+		"hashring",
+		defaultInitialHashring,
+		"Specifies the initial hashring to use if the ConfigMap does not exist.")
+	flag.BoolVar(
+		&static,
+		"static",
+		false,
+		"When enabled, the ConfigMap will be populated with the value of 'hashring' flag. No reconciliation occurs.")
+}
+
+func getLogLevel(lvl string) slog.Level {
+	switch lvl {
+	case "info":
+		return slog.LevelInfo
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		stdlog.Printf("unknown log level %q, defaulting to info", lvl)
+		return slog.LevelInfo
+	}
 }

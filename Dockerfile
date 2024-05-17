@@ -1,4 +1,4 @@
-FROM golang:1.20-bullseye AS builder
+FROM golang:1.21-bullseye AS builder
 
 WORKDIR /usr/src/app
 
@@ -14,13 +14,13 @@ COPY . .
 
 ENV CGO_ENABLED=0
 
-RUN go build \
+RUN GOOS=linux GOARCH=amd64 go build \
     -o /usr/local/bin/hashring-controller \
     -ldflags "-w -s" \
     ./cmd/controller/main.go
 
 
-RUN go build \
+RUN GOOS=linux GOARCH=amd64 go build \
     -o /usr/local/bin/sync-controller \
     -ldflags "-w -s" \
     ./cmd/sync/main.go
